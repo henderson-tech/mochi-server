@@ -280,6 +280,7 @@ func (h *Hook) OnRetainMessage(cl *mqtt.Client, pk packets.Packet, r int64) {
 		TopicName:   pk.TopicName,
 		Payload:     pk.Payload,
 		Created:     pk.Created,
+		Expiry:      pk.Expiry,
 		Client:      cl.ID,
 		Origin:      pk.Origin,
 		Properties: storage.MessageProperties{
@@ -316,6 +317,7 @@ func (h *Hook) OnQosPublish(cl *mqtt.Client, pk packets.Packet, sent int64, rese
 		Payload:     pk.Payload,
 		Sent:        sent,
 		Created:     pk.Created,
+		Expiry:      pk.Expiry,
 		Properties: storage.MessageProperties{
 			PayloadFormat:          props.PayloadFormat,
 			MessageExpiryInterval:  props.MessageExpiryInterval,

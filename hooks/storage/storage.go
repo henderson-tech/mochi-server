@@ -94,6 +94,7 @@ type Message struct {
 	TopicName   string              `json:"topic_name,omitempty"`    // the topic the message was sent to (if retained)
 	FixedHeader packets.FixedHeader `json:"fixedheader"`             // the header properties of the message
 	Created     int64               `json:"created,omitempty"`       // the time the message was created in unixtime
+	Expiry      int64               `json:"expiry,omitempty"`        // the absolute time the message expires in unixtime, so a restored message keeps its deadline
 	Sent        int64               `json:"sent,omitempty"`          // the last time the message was sent (for retries) in unixtime (if inflight)
 	PacketID    uint16              `json:"packet_id,omitempty"`     // the unique id of the packet (if inflight)
 }
@@ -133,6 +134,7 @@ func (d *Message) ToPacket() packets.Packet {
 		Payload:     d.Payload,
 		Origin:      d.Origin,
 		Created:     d.Created,
+		Expiry:      d.Expiry,
 		Properties: packets.Properties{
 			PayloadFormat:          d.Properties.PayloadFormat,
 			PayloadFormatFlag:      d.Properties.PayloadFormatFlag,
