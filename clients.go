@@ -362,6 +362,10 @@ func (cl *Client) ResendInflightMessages(force bool) error {
 	}
 
 	for _, tk := range cl.State.Inflight.GetAll(false) {
+		if cl.withheld(tk) {
+			continue
+		}
+
 		if tk.FixedHeader.Type == packets.Publish {
 			tk.FixedHeader.Dup = true // [MQTT-3.3.1-1] [MQTT-3.3.1-3]
 		}
@@ -381,6 +385,38 @@ func (cl *Client) ResendInflightMessages(force bool) error {
 	}
 
 	return nil
+}
+
+// withheld reports whether an outbound PUBLISH kept in the session must not
+// be written to this client now, and drops it from the session when so.
+//
+// A session outlives the connection that built it and is keyed by client id
+// alone, so the client holding it now may not be the one whose subscriptions
+// queued its messages: another principal reusing the id, or the same one
+// after its permissions narrowed. publishToClient asked the read ACL about
+// the client of that moment; a resend or a quota release writes straight to
+// the socket, so it asks again for this client and drops what this client
+// may not read (upstream #504).
+func (cl *Client) withheld(pk packets.Packet) bool {
+	if pk.FixedHeader.Type != packets.Publish {
+		return false
+	}
+
+	if !cl.ops.hooks.OnACLCheck(cl, pk.TopicName, false) {
+		cl.dropInflight(pk)
+		return true
+	}
+
+	return false
+}
+
+// dropInflight deletes an outbound packet the session will not deliver and
+// tells the hooks, as ClearInflights does for each packet it deletes.
+func (cl *Client) dropInflight(pk packets.Packet) {
+	if ok := cl.State.Inflight.Delete(pk.PacketID); ok {
+		cl.ops.hooks.OnQosDropped(cl, pk)
+		atomic.AddInt64(&cl.ops.info.Inflight, -1)
+	}
 }
 
 // ClearInflights deletes all inflight messages for the client, e.g. for a disconnected user with a clean session.

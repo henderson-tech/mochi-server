@@ -808,6 +808,9 @@ func (s *Server) processPacket(cl *Client, pk packets.Packet) error {
 
 	if cl.State.Inflight.Len() > 0 && atomic.LoadInt32(&cl.State.Inflight.sendQuota) > 0 {
 		next, ok := cl.State.Inflight.NextImmediate()
+		for ok && cl.withheld(next) { // withheld drops it, so the next call moves on
+			next, ok = cl.State.Inflight.NextImmediate()
+		}
 		if ok {
 			_ = cl.WritePacket(next)
 			if ok := cl.State.Inflight.Delete(next.PacketID); ok {

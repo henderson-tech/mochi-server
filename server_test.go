@@ -1646,6 +1646,7 @@ func TestServerQoS1PubackReasonCode(t *testing.T) {
 func TestServerProcessPacketAndNextImmediate(t *testing.T) {
 	s := newServer()
 	cl, r, w := newTestClient()
+	_ = cl.ops.hooks.Add(new(AllowHook), nil) // a released PUBLISH passes the read ACL first
 
 	next := *packets.TPacketData[packets.Publish].Get(packets.TPublishQos1).Packet
 	next.Expiry = -1

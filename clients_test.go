@@ -491,6 +491,7 @@ func TestClientResendInflightMessages(t *testing.T) {
 func TestClientResendInflightMessagesWriteFailure(t *testing.T) {
 	pk1 := packets.TPacketData[packets.Publish].Get(packets.TPublishQos1Dup)
 	cl, r, _ := newTestClient()
+	_ = cl.ops.hooks.Add(new(AllowHook), nil) // a resent PUBLISH passes the read ACL first
 	_ = r.Close()
 
 	cl.State.Inflight.Set(*pk1.Packet)
