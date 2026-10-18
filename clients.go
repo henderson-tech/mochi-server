@@ -214,6 +214,17 @@ func (cl *Client) WriteLoop() {
 				// TODO : Figure out what to do with error
 				cl.ops.log.Debug("failed publishing packet", "error", err, "client", cl.ID, "packet", pk)
 
+				// A delivery that expired while queued is not written. A
+				// QoS 1 or 2 one stays in the session until the expiry tick
+				// drops it through OnQosDropped - dropping it here could
+				// delete a newer delivery the tick already let reuse its
+				// packet identifier. A QoS 0 one has no session state, so
+				// it is reported dropped now.
+				if errors.Is(err, ErrPacketExpired) && pk.FixedHeader.Qos == 0 {
+					atomic.AddInt64(&cl.ops.info.MessagesDropped, 1)
+					cl.ops.hooks.OnPublishDropped(cl, *pk)
+				}
+
 				// A write that ran out of time under
 				// ClientNetWriteTimeout has put part of a packet on the
 				// wire, and there is no way to continue that stream: the
@@ -379,6 +390,10 @@ func (cl *Client) ResendInflightMessages(force bool) error {
 
 		cl.ops.hooks.OnQosPublish(cl, tk, tk.Created, 0)
 		err := cl.WritePacket(tk)
+		if errors.Is(err, ErrPacketExpired) { // it crossed its deadline since withheld looked
+			cl.dropInflight(tk)
+			continue
+		}
 		if err != nil {
 			return err
 		}
@@ -400,8 +415,30 @@ func (cl *Client) ResendInflightMessages(force bool) error {
 	return nil
 }
 
+// ErrPacketExpired is WritePacket's refusal of a PUBLISH whose absolute
+// expiry has been reached; see messageExpired.
+var ErrPacketExpired = errors.New("message expired before it could be written")
+
+// messageExpired reports whether pk is a PUBLISH whose absolute expiry
+// (Expiry, unix seconds) has been reached at now: with under a second left
+// there is no whole Message Expiry Interval to send, and the message is
+// due for deletion [MQTT-3.3.2-5].
+//
+// It holds for every protocol version. A 3.1.1 subscriber cannot see an
+// expiry, but the embedder that set one - a command that must not run late -
+// relies on it all the same; gating it on version 5 delivered such a message
+// to a 3.1.1 client at any age up to MaximumMessageExpiryInterval. It holds
+// only for PUBLISH: an acknowledgement's Expiry is the server's retention
+// deadline, which ClearExpiredInflights enforces from Created.
+func messageExpired(pk packets.Packet, now int64) bool {
+	return pk.FixedHeader.Type == packets.Publish && pk.Expiry > 0 && pk.Expiry <= now
+}
+
 // withheld reports whether an outbound PUBLISH kept in the session must not
 // be written to this client now, and drops it from the session when so.
+//
+// An expired one never is: the session may have sat offline, or waiting for
+// quota, past the deadline.
 //
 // A session outlives the connection that built it and is keyed by client id
 // alone, so the client holding it now may not be the one whose subscriptions
@@ -415,7 +452,7 @@ func (cl *Client) withheld(pk packets.Packet) bool {
 		return false
 	}
 
-	if !cl.ops.hooks.OnACLCheck(cl, pk.TopicName, false) {
+	if messageExpired(pk, time.Now().Unix()) || !cl.ops.hooks.OnACLCheck(cl, pk.TopicName, false) {
 		cl.dropInflight(pk)
 		return true
 	}
@@ -446,14 +483,22 @@ func (cl *Client) ClearInflights() {
 func (cl *Client) ClearExpiredInflights(now, maximumExpiry int64) []uint16 {
 	deleted := []uint16{}
 	for _, tk := range cl.State.Inflight.GetAll(false) {
-		expired := tk.ProtocolVersion == 5 && tk.Expiry > 0 && tk.Expiry < now // [MQTT-3.3.2-5]
+		expired := messageExpired(tk, now) // [MQTT-3.3.2-5], for every protocol version
 
 		// If the maximum message expiry interval is set (greater than 0), and the message
 		// retention period exceeds the maximum expiry, the message will be forcibly removed.
 		enforced := maximumExpiry > 0 && now-tk.Created > maximumExpiry
 
 		if expired || enforced {
+			// A PUBLISH queued or written took a slot of the client's
+			// Receive Maximum, which its acknowledgement would have
+			// returned; deleted, it returns the slot here. A held one never
+			// took a slot.
+			slot := tk.FixedHeader.Type == packets.Publish && !cl.State.Inflight.isHeld(tk.PacketID)
 			if ok := cl.State.Inflight.Delete(tk.PacketID); ok {
+				if slot {
+					cl.State.Inflight.IncreaseSendQuota()
+				}
 				cl.ops.hooks.OnQosDropped(cl, tk)
 				atomic.AddInt64(&cl.ops.info.Inflight, -1)
 				deleted = append(deleted, tk.PacketID)
@@ -672,12 +717,15 @@ func (cl *Client) WritePacket(pk packets.Packet) error {
 		return nil
 	}
 
-	if pk.Expiry > 0 {
-		expiry := pk.Expiry - time.Now().Unix()
-		if expiry < 1 {
-			expiry = 1
+	if pk.FixedHeader.Type == packets.Publish && pk.Expiry > 0 {
+		// An expired PUBLISH is refused, not sent with its interval clamped
+		// to one second: clamping delivered every late message, and to a
+		// 3.1.1 client, which carries no interval, as if it were on time.
+		now := time.Now().Unix()
+		if messageExpired(pk, now) {
+			return ErrPacketExpired
 		}
-		pk.Properties.MessageExpiryInterval = uint32(expiry) // [MQTT-3.3.2-6]
+		pk.Properties.MessageExpiryInterval = uint32(pk.Expiry - now) // [MQTT-3.3.2-6]
 	}
 
 	pk.ProtocolVersion = cl.Properties.ProtocolVersion

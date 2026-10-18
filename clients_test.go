@@ -446,7 +446,7 @@ func TestClientClearExpiredInflights(t *testing.T) {
 	require.Equal(t, 2, cl.State.Inflight.Len())
 
 	cl.State.Inflight.Set(packets.Packet{PacketID: 11, Expiry: n - 1})
-	cl.State.Inflight.Set(packets.Packet{PacketID: 12, Expiry: n - 2})  // expiry is ineffective for v3.
+	cl.State.Inflight.Set(packets.Packet{PacketID: 12, Expiry: n - 2})  // over max server expiry limit (Created 0)
 	cl.State.Inflight.Set(packets.Packet{PacketID: 13, Created: n - 3}) // within bounds for v3
 	cl.State.Inflight.Set(packets.Packet{PacketID: 15, Created: n - 5}) // over max server expiry limit
 	require.Equal(t, 6, cl.State.Inflight.Len())
@@ -461,9 +461,9 @@ func TestClientClearExpiredInflights(t *testing.T) {
 	require.Len(t, deleted, 0)
 	require.Equal(t, 4, cl.State.Inflight.Len())
 
-	cl.State.Inflight.Set(packets.Packet{ProtocolVersion: 5, PacketID: 18, Expiry: n - 1})
+	cl.State.Inflight.Set(packets.Packet{FixedHeader: packets.FixedHeader{Type: packets.Publish}, PacketID: 18, Expiry: n - 1})
 	deleted = cl.ClearExpiredInflights(n, 0)        // maximumExpiry = 0 do not abandon messages
-	require.ElementsMatch(t, []uint16{18}, deleted) // expiry is still effective for v5.
+	require.ElementsMatch(t, []uint16{18}, deleted) // a PUBLISH expiry holds for every protocol version.
 	require.Len(t, deleted, 1)
 	require.Equal(t, 4, cl.State.Inflight.Len())
 }

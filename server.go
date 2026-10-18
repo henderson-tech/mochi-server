@@ -825,7 +825,7 @@ func (s *Server) processPacket(cl *Client, pk packets.Packet) error {
 			case err == nil:
 				cl.State.Inflight.release(next.PacketID)
 				cl.State.Inflight.DecreaseSendQuota()
-			case errors.Is(err, packets.ErrPacketTooLarge):
+			case errors.Is(err, packets.ErrPacketTooLarge), errors.Is(err, ErrPacketExpired):
 				cl.dropInflight(next) // no write to this connection can carry it
 			}
 			// Any other failure is the connection's: the delivery stays held
@@ -1950,12 +1950,11 @@ func (s *Server) clearExpiredRetainedMessages(now int64) {
 
 // clearExpiredInflights deletes any inflight messages which have expired.
 func (s *Server) clearExpiredInflights(now int64) {
+	// ClearExpiredInflights tells OnQosDropped about each packet it deletes,
+	// with the whole packet. A second call here, with the packet identifier
+	// alone, made every hook see each expiry twice.
 	for _, client := range s.Clients.GetAll() {
-		if deleted := client.ClearExpiredInflights(now, s.Options.Capabilities.MaximumMessageExpiryInterval); len(deleted) > 0 {
-			for _, id := range deleted {
-				s.hooks.OnQosDropped(client, packets.Packet{PacketID: id})
-			}
-		}
+		client.ClearExpiredInflights(now, s.Options.Capabilities.MaximumMessageExpiryInterval)
 	}
 }
 
@@ -1963,6 +1962,11 @@ func (s *Server) clearExpiredInflights(now int64) {
 func (s *Server) sendDelayedLWT(dt int64) {
 	for id, pk := range s.loop.willDelayed.GetAll() {
 		if dt > pk.Expiry {
+			// Expiry held the end of the Will Delay Interval, which has now
+			// passed. It is not the message's expiry: left in place, every
+			// delivery of the Will would be refused as expired.
+			// publishToSubscribers gives the message its own.
+			pk.Expiry = 0
 			s.publishToSubscribers(pk) // [MQTT-3.1.2-8]
 			if cl, ok := s.Clients.Get(id); ok {
 				if pk.FixedHeader.Retain {
