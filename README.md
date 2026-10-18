@@ -1,5 +1,7 @@
 # Mochi-MQTT Server
 
+> **This is henderson-tech's fork for Voke.** The `voke` branch carries a few generic fixes on top of upstream's `release/2.8.0`; what they are, the `v2.8.0-voke.N` tags and how to rebase are in [VOKE.md](VOKE.md).
+
 <p align="center">
     
 ![build status](https://github.com/mochi-mqtt/server/actions/workflows/build.yml/badge.svg) 
