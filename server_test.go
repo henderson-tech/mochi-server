@@ -1649,8 +1649,8 @@ func TestServerProcessPacketAndNextImmediate(t *testing.T) {
 	_ = cl.ops.hooks.Add(new(AllowHook), nil) // a released PUBLISH passes the read ACL first
 
 	next := *packets.TPacketData[packets.Publish].Get(packets.TPublishQos1).Packet
-	next.Expiry = -1
 	cl.State.Inflight.Set(next)
+	cl.State.Inflight.hold(next.PacketID)
 	atomic.StoreInt64(&s.Info.Inflight, 1)
 	require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.Inflight))
 	require.Equal(t, int32(5), cl.State.Inflight.sendQuota)
@@ -1664,7 +1664,11 @@ func TestServerProcessPacketAndNextImmediate(t *testing.T) {
 	buf, err := io.ReadAll(r)
 	require.NoError(t, err)
 	require.Equal(t, packets.TPacketData[packets.Publish].Get(packets.TPublishQos1).RawBytes, buf)
-	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Inflight))
+	// Written, the delivery is in flight until its PUBACK, no longer held.
+	require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.Inflight))
+	_, inFlight := cl.State.Inflight.Get(next.PacketID)
+	require.True(t, inFlight)
+	require.False(t, cl.State.Inflight.isHeld(next.PacketID))
 	require.Equal(t, int32(4), cl.State.Inflight.sendQuota)
 }
 

@@ -16,6 +16,7 @@ import (
 type Inflight struct {
 	sync.RWMutex
 	internal            map[uint16]packets.Packet // internal contains the inflight packets
+	held                map[uint16]struct{}       // ids of outbound packets waiting for send quota, see hold
 	receiveQuota        int32                     // remaining inbound qos quota for flow control
 	sendQuota           int32                     // remaining outbound qos quota for flow control
 	maximumReceiveQuota int32                     // maximum allowed receive quota
@@ -26,6 +27,7 @@ type Inflight struct {
 func NewInflights() *Inflight {
 	return &Inflight{
 		internal: map[uint16]packets.Packet{},
+		held:     map[uint16]struct{}{},
 	}
 }
 
@@ -36,7 +38,44 @@ func (i *Inflight) Set(m packets.Packet) bool {
 
 	_, ok := i.internal[m.PacketID]
 	i.internal[m.PacketID] = m
+	delete(i.held, m.PacketID) // a packet set under an id starts out not held
 	return !ok
+}
+
+// hold marks the packet under id as waiting for send quota: it has not been
+// written, and goes out through NextImmediate once quota frees.
+//
+// The mark used to be Expiry -1, which overwrote the packet's absolute
+// expiry: a held delivery then never expired on its own deadline and went
+// out with no Message Expiry Interval. Kept beside the packet, the mark
+// leaves the expiry intact.
+func (i *Inflight) hold(id uint16) {
+	i.Lock()
+	defer i.Unlock()
+
+	if _, ok := i.internal[id]; !ok {
+		return
+	}
+	if i.held == nil {
+		i.held = map[uint16]struct{}{}
+	}
+	i.held[id] = struct{}{}
+}
+
+// release clears the hold on the packet under id once it has been written:
+// it is then in flight like any other delivery.
+func (i *Inflight) release(id uint16) {
+	i.Lock()
+	defer i.Unlock()
+	delete(i.held, id)
+}
+
+// isHeld reports whether the packet under id waits for send quota.
+func (i *Inflight) isHeld(id uint16) bool {
+	i.RLock()
+	defer i.RUnlock()
+	_, ok := i.held[id]
+	return ok
 }
 
 // Get returns an inflight packet by packet id.
@@ -67,6 +106,9 @@ func (i *Inflight) Clone() *Inflight {
 	for k, v := range i.internal {
 		c.internal[k] = v
 	}
+	for k := range i.held {
+		c.held[k] = struct{}{}
+	}
 	return c
 }
 
@@ -76,8 +118,8 @@ func (i *Inflight) GetAll(immediate bool) []packets.Packet {
 	defer i.RUnlock()
 
 	m := []packets.Packet{}
-	for _, v := range i.internal {
-		if !immediate || (immediate && v.Expiry < 0) {
+	for k, v := range i.internal {
+		if _, held := i.held[k]; !immediate || held {
 			m = append(m, v)
 		}
 	}
@@ -126,6 +168,7 @@ func (i *Inflight) Delete(id uint16) bool {
 
 	_, ok := i.internal[id]
 	delete(i.internal, id)
+	delete(i.held, id)
 
 	return ok
 }

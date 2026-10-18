@@ -39,21 +39,23 @@ func TestInflightGetAllAndImmediate(t *testing.T) {
 	cl, _, _ := newTestClient()
 	cl.State.Inflight.Set(packets.Packet{PacketID: 1, Created: 1})
 	cl.State.Inflight.Set(packets.Packet{PacketID: 2, Created: 2})
-	cl.State.Inflight.Set(packets.Packet{PacketID: 3, Created: 3, Expiry: -1})
-	cl.State.Inflight.Set(packets.Packet{PacketID: 4, Created: 4, Expiry: -1})
+	cl.State.Inflight.Set(packets.Packet{PacketID: 3, Created: 3})
+	cl.State.Inflight.Set(packets.Packet{PacketID: 4, Created: 4})
 	cl.State.Inflight.Set(packets.Packet{PacketID: 5, Created: 5})
+	cl.State.Inflight.hold(3)
+	cl.State.Inflight.hold(4)
 
 	require.Equal(t, []packets.Packet{
 		{PacketID: 1, Created: 1},
 		{PacketID: 2, Created: 2},
-		{PacketID: 3, Created: 3, Expiry: -1},
-		{PacketID: 4, Created: 4, Expiry: -1},
+		{PacketID: 3, Created: 3},
+		{PacketID: 4, Created: 4},
 		{PacketID: 5, Created: 5},
 	}, cl.State.Inflight.GetAll(false))
 
 	require.Equal(t, []packets.Packet{
-		{PacketID: 3, Created: 3, Expiry: -1},
-		{PacketID: 4, Created: 4, Expiry: -1},
+		{PacketID: 3, Created: 3},
+		{PacketID: 4, Created: 4},
 	}, cl.State.Inflight.GetAll(true))
 }
 
@@ -235,20 +237,22 @@ func TestNextImmediate(t *testing.T) {
 	cl, _, _ := newTestClient()
 	cl.State.Inflight.Set(packets.Packet{PacketID: 1, Created: 1})
 	cl.State.Inflight.Set(packets.Packet{PacketID: 2, Created: 2})
-	cl.State.Inflight.Set(packets.Packet{PacketID: 3, Created: 3, Expiry: -1})
-	cl.State.Inflight.Set(packets.Packet{PacketID: 4, Created: 4, Expiry: -1})
+	cl.State.Inflight.Set(packets.Packet{PacketID: 3, Created: 3})
+	cl.State.Inflight.Set(packets.Packet{PacketID: 4, Created: 4})
 	cl.State.Inflight.Set(packets.Packet{PacketID: 5, Created: 5})
+	cl.State.Inflight.hold(3)
+	cl.State.Inflight.hold(4)
 
 	pk, ok := cl.State.Inflight.NextImmediate()
 	require.True(t, ok)
-	require.Equal(t, packets.Packet{PacketID: 3, Created: 3, Expiry: -1}, pk)
+	require.Equal(t, packets.Packet{PacketID: 3, Created: 3}, pk)
 
 	r := cl.State.Inflight.Delete(3)
 	require.True(t, r)
 
 	pk, ok = cl.State.Inflight.NextImmediate()
 	require.True(t, ok)
-	require.Equal(t, packets.Packet{PacketID: 4, Created: 4, Expiry: -1}, pk)
+	require.Equal(t, packets.Packet{PacketID: 4, Created: 4}, pk)
 
 	r = cl.State.Inflight.Delete(4)
 	require.True(t, r)
@@ -269,7 +273,8 @@ func TestNextImmediate(t *testing.T) {
 // so the assertion is that the workers finish at all.
 func TestNextImmediateDoesNotDeadlockAgainstAWriter(t *testing.T) {
 	cl, _, _ := newTestClient()
-	cl.State.Inflight.Set(packets.Packet{PacketID: 1, Created: 1, Expiry: -1})
+	cl.State.Inflight.Set(packets.Packet{PacketID: 1, Created: 1})
+	cl.State.Inflight.hold(1)
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup

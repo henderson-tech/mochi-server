@@ -362,6 +362,13 @@ func (cl *Client) ResendInflightMessages(force bool) error {
 	}
 
 	for _, tk := range cl.State.Inflight.GetAll(false) {
+		// A held delivery was never written, so it is not re-sent: it goes
+		// out through NextImmediate as send quota frees, within the client's
+		// Receive Maximum [MQTT-3.3.4-9].
+		if cl.State.Inflight.isHeld(tk.PacketID) {
+			continue
+		}
+
 		if cl.withheld(tk) {
 			continue
 		}
@@ -374,6 +381,12 @@ func (cl *Client) ResendInflightMessages(force bool) error {
 		err := cl.WritePacket(tk)
 		if err != nil {
 			return err
+		}
+
+		if tk.FixedHeader.Type == packets.Publish {
+			// Outstanding again, it holds a slot of the quota the resumed
+			// session started with, which its acknowledgement returns.
+			cl.State.Inflight.DecreaseSendQuota()
 		}
 
 		if tk.FixedHeader.Type == packets.Puback || tk.FixedHeader.Type == packets.Pubcomp {

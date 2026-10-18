@@ -812,11 +812,24 @@ func (s *Server) processPacket(cl *Client, pk packets.Packet) error {
 			next, ok = cl.State.Inflight.NextImmediate()
 		}
 		if ok {
-			_ = cl.WritePacket(next)
-			if ok := cl.State.Inflight.Delete(next.PacketID); ok {
-				atomic.AddInt64(&s.Info.Inflight, -1)
+			// Once written, a held delivery is in flight like any other
+			// QoS 1 or 2 delivery: it stays in the session until the client
+			// acknowledges it, and that acknowledgement returns its quota.
+			// Deleting it here lost it from the session - never resent after
+			// a reconnect - and leaked the quota slot, because the
+			// acknowledgement then found nothing to complete: a client whose
+			// Receive Maximum ran out once had every later delivery held for
+			// good.
+			err := cl.WritePacket(next)
+			switch {
+			case err == nil:
+				cl.State.Inflight.release(next.PacketID)
+				cl.State.Inflight.DecreaseSendQuota()
+			case errors.Is(err, packets.ErrPacketTooLarge):
+				cl.dropInflight(next) // no write to this connection can carry it
 			}
-			cl.State.Inflight.DecreaseSendQuota()
+			// Any other failure is the connection's: the delivery stays held
+			// for the session's next connection.
 		}
 	}
 
@@ -1271,8 +1284,7 @@ func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packet
 		}
 
 		if sentQuota == 0 && atomic.LoadInt32(&cl.State.Inflight.maximumSendQuota) > 0 {
-			out.Expiry = -1
-			cl.State.Inflight.Set(out)
+			cl.State.Inflight.hold(out.PacketID)
 			return out, nil
 		}
 	}
