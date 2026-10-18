@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -521,8 +522,8 @@ func (cl *Client) ReadPacket(fh *packets.FixedHeader) (pk packets.Packet, err er
 
 	pk.ProtocolVersion = cl.Properties.ProtocolVersion // inherit client protocol version for decoding
 	pk.FixedHeader = *fh
-	p := make([]byte, pk.FixedHeader.Remaining)
-	n, err := io.ReadFull(cl.Net.bconn, p)
+	p, err := readRemaining(cl.Net.bconn, pk.FixedHeader.Remaining)
+	n := len(p)
 	if err != nil {
 		return pk, err
 	}
@@ -574,6 +575,42 @@ func (cl *Client) ReadPacket(fh *packets.FixedHeader) (pk packets.Packet, err er
 
 	pk, err = cl.ops.hooks.OnPacketRead(cl, pk)
 	return
+}
+
+// remainingReadStep is the most readRemaining allocates ahead of the bytes
+// that have actually arrived.
+const remainingReadStep = 64 * 1024
+
+// readRemaining reads exactly n bytes: the remaining length a fixed header
+// declared. That length is the client's claim, not bytes on the wire - up to
+// 256 MiB may be declared with nothing following, and before CONNECT has been
+// authenticated. Allocating it up front let a few silent connections pin as
+// much memory as they cared to declare (upstream #502). So the buffer grows
+// only as bytes arrive, doubling from remainingReadStep, and a sender that
+// stalls holds at most about twice what it actually sent.
+func readRemaining(r io.Reader, n int) ([]byte, error) {
+	if n <= remainingReadStep {
+		p := make([]byte, n)
+		_, err := io.ReadFull(r, p)
+		return p, err
+	}
+
+	p := make([]byte, 0, remainingReadStep)
+	for len(p) < n {
+		if len(p) == cap(p) {
+			p = slices.Grow(p, min(len(p), n-len(p)))
+		}
+		got, err := io.ReadFull(r, p[len(p):min(cap(p), n)])
+		p = p[:len(p)+got]
+		if err != nil {
+			if errors.Is(err, io.EOF) && len(p) > 0 {
+				err = io.ErrUnexpectedEOF // as io.ReadFull reports a read cut short
+			}
+			return p, err
+		}
+	}
+
+	return p, nil
 }
 
 // WritePacket encodes and writes a packet to the client.
