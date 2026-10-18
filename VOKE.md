@@ -48,6 +48,7 @@ disconnected.
 | `48819b9` expiry: absolute expiry for every protocol and write path | Expiry was honoured only for MQTT 5, and only by the 1 s tick. Resend and the quota release never checked it. `WritePacket` clamped an expired interval to 1 s and sent the message anyway. One rule (`messageExpired`) now covers every path and protocol version. A delayed Will no longer reads as expired. Each expiry fires `OnQosDropped` once, not twice. | none filed |
 | `d40bbbf` storage: a stored message keeps its absolute expiry | `storage.Message` had no `Expiry` field, so a message restored after a restart had no deadline. | none |
 | `feecf0e` test: PUBACK follows OnPublish; Ignore skips retain and fan-out | Tests that pin the publish-hook contract Voke builds on. | none |
+| `b9dcc01` server: a connection lost at its CONNACK ends like any other | A connection that failed after authentication but before its read loop (the CONNACK write to a peer that reset the socket, or the resend of a resumed session) returned without `OnDisconnect`, without its Will, and left a clean session in `s.Clients`, for a 3.1.1 client by default forever. Every exit after authentication now runs the read loop's end bookkeeping, and an earlier connection's delayed Will is dropped before the CONNACK, not after it. | none filed |
 
 ### Known gaps that stay unfixed
 

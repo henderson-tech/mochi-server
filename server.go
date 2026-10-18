@@ -498,17 +498,21 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 	sessionPresent := s.inheritClientSession(pk, cl)
 	s.Clients.Add(cl) // [MQTT-4.1.0-1]
 
+	// The session is this connection's now, so a Will an earlier connection
+	// left delayed is void whether or not the CONNACK arrives. Deleted only
+	// after the write, a failed CONNACK left that Will to fire beside the one
+	// this connection publishes as it ends. [MQTT-3.1.3-9]
+	s.loop.willDelayed.Delete(cl.ID)
+
 	err = s.SendConnack(cl, code, sessionPresent, nil) // [MQTT-3.1.4-5] [MQTT-3.2.0-1] [MQTT-3.2.0-2] &[MQTT-3.14.0-1]
 	if err != nil {
-		return fmt.Errorf("ack connection packet: %w", err)
+		return s.endConnection(cl, listener, fmt.Errorf("ack connection packet: %w", err))
 	}
-
-	s.loop.willDelayed.Delete(cl.ID) // [MQTT-3.1.3-9]
 
 	if sessionPresent {
 		err = cl.ResendInflightMessages(true)
 		if err != nil {
-			return fmt.Errorf("resend inflight: %w", err)
+			return s.endConnection(cl, listener, fmt.Errorf("resend inflight: %w", err))
 		}
 	}
 
@@ -537,6 +541,22 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 			cl.Properties.ProtocolVersion == 5 {
 			_ = s.DisconnectClient(cl, packets.ErrPacketTooLarge)
 		}
+	}
+
+	return s.endConnection(cl, listener, err)
+}
+
+// endConnection ends a connection whose CONNECT was authenticated, whichever
+// step ended it: the CONNACK write, the resend of a resumed session, or the
+// read loop. Each owes the same bookkeeping: the Will on an unclean end,
+// OnDisconnect, and the session's removal from s.Clients when it ends with
+// the connection. A peer that resets the socket right after CONNECT fails the
+// CONNACK write, and returning there skipped all of it: a hook that tracks a
+// session from OnConnectAuthenticate never heard it end, and a 3.1.1 client's
+// dead entry stayed in s.Clients until MaximumSessionExpiryInterval, which
+// defaults to never.
+func (s *Server) endConnection(cl *Client, listener string, err error) error {
+	if err != nil {
 		s.sendLWT(cl)
 		cl.Stop(err)
 	} else {
