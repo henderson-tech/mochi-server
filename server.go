@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -174,6 +175,7 @@ type Server struct {
 	Log          *slog.Logger         // minimal no-alloc logger
 	hooks        *Hooks               // hooks contains hooks for extra functionality such as auth and persistent storage
 	inlineClient *Client              // inlineClient is a special client used for inline subscriptions and inline Publish
+	sessions     sessionLocks         // serialises the acts that read and replace one client id's session
 }
 
 // loop contains interval tickers for the system events loop.
@@ -495,8 +497,7 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 
 	s.hooks.OnSessionEstablish(cl, pk)
 
-	sessionPresent := s.inheritClientSession(pk, cl)
-	s.Clients.Add(cl) // [MQTT-4.1.0-1]
+	sessionPresent := s.attachSession(pk, cl)
 
 	// The session is this connection's now, so a Will an earlier connection
 	// left delayed is void whether or not the CONNACK arrives. Deleted only
@@ -567,10 +568,18 @@ func (s *Server) endConnection(cl *Client, listener string, err error) error {
 	expire := (cl.Properties.ProtocolVersion == 5 && cl.Properties.Props.SessionExpiryInterval == 0) || (cl.Properties.ProtocolVersion < 5 && cl.Properties.Clean)
 	s.hooks.OnDisconnect(cl, err, expire)
 
-	if expire && !cl.IsTakenOver() {
-		cl.ClearInflights()
-		s.UnsubscribeClient(cl)
-		s.Clients.Delete(cl.ID) // [MQTT-4.1.0-2] ![MQTT-3.1.2-23]
+	// Under the id's session lock, so a successor attaching now either takes
+	// this session over first (and this end leaves it alone) or finds it gone:
+	// the cleanup runs on the client id, and run beside a takeover it removed
+	// the successor's subscriptions and its entry in s.Clients.
+	if expire {
+		unlock := s.sessions.lock(cl.ID)
+		if !cl.IsTakenOver() {
+			cl.ClearInflights()
+			s.UnsubscribeClient(cl)
+			s.Clients.DeleteClient(cl) // [MQTT-4.1.0-2] ![MQTT-3.1.2-23]
+		}
+		unlock()
 	}
 
 	return err
@@ -707,6 +716,19 @@ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 	}
 
 	return false // [MQTT-3.2.2-2]
+}
+
+// attachSession makes cl the holder of its client id's session: it takes over
+// the session an earlier connection or the store left, and registers cl. The
+// read of the session it takes over and its registration happen under the
+// id's session lock, so every earlier connection is taken over by the one
+// that follows it and the last to attach holds the session.
+func (s *Server) attachSession(pk packets.Packet, cl *Client) bool {
+	unlock := s.sessions.lock(cl.ID)
+	defer unlock()
+	sessionPresent := s.inheritClientSession(pk, cl)
+	s.Clients.Add(cl) // [MQTT-4.1.0-1]
+	return sessionPresent
 }
 
 // SendConnack returns a Connack packet to a client.
@@ -1945,10 +1967,22 @@ func (s *Server) clearExpiredClients(dt int64) {
 		}
 
 		if disconnected+int64(expire) < dt {
-			s.hooks.OnClientExpired(client)
-			s.Clients.Delete(id) // [MQTT-4.1.0-2]
+			s.expireClient(id, client)
 		}
 	}
+}
+
+// expireClient removes the expired session client listed under id, unless a
+// connection has taken the id since the sweep listed it: the sweep works on a
+// copy of s.Clients, and deleting by id removed the new connection's session.
+func (s *Server) expireClient(id string, client *Client) {
+	unlock := s.sessions.lock(id)
+	defer unlock()
+	if cur, ok := s.Clients.Get(id); !ok || cur != client {
+		return
+	}
+	s.hooks.OnClientExpired(client)
+	s.Clients.Delete(id) // [MQTT-4.1.0-2]
 }
 
 // clearExpiredRetainedMessage deletes retained messages from topics if they have expired.
@@ -2020,4 +2054,49 @@ func minimum(a, b int64) (m int64) {
 		m = b
 	}
 	return
+}
+
+// sessionLocks serialises, per client id, the acts that read the session a
+// client id holds and then replace or remove it: a connection taking the
+// session over (attachSession), a connection ending with its session
+// (endConnection), and the expiry sweep (clearExpiredClients). Each reads
+// s.Clients and the topic index under the id and then writes them; run
+// concurrently, two of them each acted on what the other had already
+// replaced. A broker restarted under thousands of devices meets exactly that:
+// a device's abandoned socket and its retry attach at once. Locks are per id,
+// so unrelated clients never wait on each other, and an entry lives only
+// while someone holds or waits for it.
+type sessionLocks struct {
+	mu sync.Mutex
+	m  map[string]*sessionLock
+}
+
+type sessionLock struct {
+	sync.Mutex
+	refs int
+}
+
+// lock takes id's session lock and returns its release.
+func (l *sessionLocks) lock(id string) (unlock func()) {
+	l.mu.Lock()
+	if l.m == nil {
+		l.m = map[string]*sessionLock{}
+	}
+	e := l.m[id]
+	if e == nil {
+		e = new(sessionLock)
+		l.m[id] = e
+	}
+	e.refs++
+	l.mu.Unlock()
+
+	e.Lock()
+	return func() {
+		e.Unlock()
+		l.mu.Lock()
+		if e.refs--; e.refs == 0 {
+			delete(l.m, id)
+		}
+		l.mu.Unlock()
+	}
 }
