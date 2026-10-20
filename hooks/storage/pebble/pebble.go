@@ -211,7 +211,14 @@ func (h *Hook) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
 		return
 	}
 
-	h.updateClient(cl)
+	// A client without a connection, stopped as the server shut down, is one
+	// the server restored from this store as it booted (Server.loadClients):
+	// its record is what was just read. Rewriting it cost a write per stored
+	// session, synced in Sync mode, before the server served, and dropped what
+	// a restored client does not carry, such as its remote address.
+	if cl.Net.Conn != nil || !errors.Is(cl.StopCause(), packets.ErrServerShuttingDown) {
+		h.updateClient(cl)
+	}
 
 	if !expire {
 		return
