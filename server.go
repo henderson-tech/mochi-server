@@ -1808,6 +1808,14 @@ func (s *Server) sendLWT(cl *Client) {
 	}
 
 	if cl.Properties.Will.WillDelayInterval > 0 {
+		// A connection already taken over has its delay cut short by the
+		// connection that took the id [MQTT-3.1.3-9]: queued under the shared
+		// client id, its Will would fire while the successor is connected,
+		// and clear the successor's own Will.
+		if cl.IsTakenOver() {
+			atomic.StoreUint32(&cl.Properties.Will.Flag, 0)
+			return
+		}
 		pk.Connect.WillProperties.WillDelayInterval = cl.Properties.Will.WillDelayInterval
 		pk.Expiry = time.Now().Unix() + int64(pk.Connect.WillProperties.WillDelayInterval)
 		s.loop.willDelayed.Add(cl.ID, pk)

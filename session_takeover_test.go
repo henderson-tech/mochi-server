@@ -268,3 +268,27 @@ func TestSecondConnectSendsTheWillOnce(t *testing.T) {
 	require.Equal(t, int32(1), hook.sent.Load())
 	_ = w.Close()
 }
+
+// A connection taken over before its end ran queues no delayed Will: the
+// connection that took the id cut its delay short [MQTT-3.1.3-9]. Queued
+// under the shared client id, it fired while the successor was connected and
+// cleared the successor's own Will.
+func TestTakenOverConnectionQueuesNoDelayedWill(t *testing.T) {
+	s := newServer()
+	old, _, _ := newTestClient()
+	old.ID = "zen"
+	old.Properties.ProtocolVersion = 4 // no DISCONNECT is written to a 3.1.1 client the test never reads
+	old.Properties.Will = Will{Flag: 1, TopicName: "lwt", Payload: []byte("old"), WillDelayInterval: 30}
+	s.Clients.Add(old)
+
+	next, _, _ := newTestClient()
+	next.ID = "zen"
+	next.Properties.Will = Will{Flag: 1, TopicName: "lwt", Payload: []byte("next"), WillDelayInterval: 30}
+	s.attachSession(connectPacket(false), next)
+	_ = s.endConnection(old, "tcp", errors.New("connection reset"))
+
+	_, queued := s.loop.willDelayed.Get("zen")
+	require.False(t, queued, "the taken-over connection queued its delayed Will")
+	s.sendDelayedLWT(time.Now().Unix() + 60)
+	require.Equal(t, uint32(1), next.Properties.Will.Flag, "the successor's Will was cleared")
+}
