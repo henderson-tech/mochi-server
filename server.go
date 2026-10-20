@@ -889,8 +889,11 @@ func (s *Server) processPacket(cl *Client, pk packets.Packet) error {
 
 // processConnect processes a Connect packet. The packet cannot be used to establish
 // a new connection on an existing connection. See EstablishConnection instead.
+// processConnect refuses a second CONNECT. The error ends the connection, and
+// its end (endConnection) publishes the Will under the id's session lock; sent
+// here, outside it, the Will's OnWillSent could rewrite the record of a
+// successor taking the session over at the same moment.
 func (s *Server) processConnect(cl *Client, _ packets.Packet) error {
-	s.sendLWT(cl)
 	return packets.ErrProtocolViolationSecondConnect // [MQTT-3.1.0-2]
 }
 
@@ -2025,22 +2028,24 @@ func (s *Server) clearExpiredInflights(now int64) {
 func (s *Server) sendDelayedLWT(dt int64) {
 	for id, pk := range s.loop.willDelayed.GetAll() {
 		if dt > pk.Expiry {
-			s.sendDelayedWill(id)
+			s.sendDelayedWill(id, dt)
 		}
 	}
 }
 
 // sendDelayedWill publishes the delayed Will listed under id, under the id's
-// session lock and only while it is still listed: the list is read from a
+// session lock and only while it is still listed and due at dt: the list is read from a
 // copy, and a connection that took the id since has deleted it
 // (attachSession). Sent from the copy, the earlier connection's Will fired
 // after the session was taken, and the new connection's own Will was
 // cleared in its place.
-func (s *Server) sendDelayedWill(id string) {
+func (s *Server) sendDelayedWill(id string, dt int64) {
 	unlock := s.sessions.lock(id)
 	defer unlock()
+	// Rechecked under the lock: the Will listed now may be a newer one, left
+	// by a connection that took the id and ended since, still in its delay.
 	pk, ok := s.loop.willDelayed.Get(id)
-	if !ok {
+	if !ok || dt <= pk.Expiry {
 		return
 	}
 	// Expiry held the end of the Will Delay Interval, which has now passed.

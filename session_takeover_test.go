@@ -2,6 +2,8 @@ package mqtt
 
 import (
 	"errors"
+	"io"
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -210,4 +212,59 @@ func TestDiscardClientEndsOnlyTheOfflineSessionItNames(t *testing.T) {
 	require.True(t, ok, "the discarded client's end removed the new session")
 	require.Same(t, next, holder)
 	require.Contains(t, s.Topics.Subscribers("a/b").Subscriptions, "zen", "the discarded client's end unsubscribed the new session")
+}
+
+// A delayed Will is sent only if the Will listed when the id's lock is held
+// is still due. The sweep picks due Wills from a copy; meanwhile a connection
+// may take the id, end, and leave a Will of its own still in its delay, which
+// was published at once and cleared from that connection.
+func TestDelayedWillSendRechecksTheListedWill(t *testing.T) {
+	s := newServer()
+	cl, _, _ := newTestClient()
+	cl.ID = "zen"
+	cl.Properties.Will = Will{Flag: 1, TopicName: "lwt", Payload: []byte("gone"), WillDelayInterval: 30}
+	s.Clients.Add(cl)
+	now := time.Now().Unix()
+	s.loop.willDelayed.Add("zen", packets.Packet{TopicName: "lwt", Origin: "zen", Expiry: now + 30})
+
+	s.sendDelayedWill("zen", now) // the sweep had seen an earlier, due Will
+	_, listed := s.loop.willDelayed.Get("zen")
+	require.True(t, listed, "a Will still in its delay was sent")
+	require.Equal(t, uint32(1), cl.Properties.Will.Flag, "a Will still in its delay was cleared")
+
+	s.sendDelayedWill("zen", now+31)
+	_, listed = s.loop.willDelayed.Get("zen")
+	require.False(t, listed, "a due Will was not sent")
+}
+
+// willCount counts the Wills sent.
+type willCount struct {
+	HookBase
+	sent atomic.Int32
+}
+
+func (h *willCount) ID() string                         { return "will-count" }
+func (h *willCount) Provides(b byte) bool               { return b == OnWillSent || b == OnConnectAuthenticate }
+func (h *willCount) OnWillSent(*Client, packets.Packet) { h.sent.Add(1) }
+func (h *willCount) OnConnectAuthenticate(*Client, packets.Packet) bool {
+	return true
+}
+
+// A second CONNECT ends the connection, and its Will is published once, by
+// the connection's end under the session lock, not ahead of it.
+func TestSecondConnectSendsTheWillOnce(t *testing.T) {
+	s := newServer()
+	hook := new(willCount)
+	require.NoError(t, s.AddHook(hook, nil))
+	r, w := net.Pipe()
+	o := make(chan error)
+	go func() { o <- s.EstablishConnection("tcp", r) }()
+	go func() { _, _ = io.Copy(io.Discard, w) }()
+	_, err := w.Write(packets.TPacketData[packets.Connect].Get(packets.TConnectUserPassLWT).RawBytes)
+	require.NoError(t, err)
+	_, _ = w.Write(packets.TPacketData[packets.Connect].Get(packets.TConnectUserPassLWT).RawBytes)
+
+	require.ErrorIs(t, <-o, packets.ErrProtocolViolationSecondConnect)
+	require.Equal(t, int32(1), hook.sent.Load())
+	_ = w.Close()
 }
