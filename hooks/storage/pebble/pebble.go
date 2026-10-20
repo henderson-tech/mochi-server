@@ -169,6 +169,13 @@ func (h *Hook) OnSessionEstablished(cl *mqtt.Client, pk packets.Packet) {
 
 // OnWillSent is called when a client sends a Will Message and the Will Message is removed from the client record.
 func (h *Hook) OnWillSent(cl *mqtt.Client, pk packets.Packet) {
+	// A taken-over or discarded client no longer owns the record: its Will goes
+	// out, but rewriting the record would overwrite its successor's, or bring
+	// a discarded session back. The server sends a Will under the id's session
+	// lock, so IsTakenOver is settled.
+	if cl.IsTakenOver() {
+		return
+	}
 	h.updateClient(cl)
 }
 
