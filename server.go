@@ -517,7 +517,15 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 		}
 	}
 
-	s.hooks.OnSessionEstablished(cl, pk)
+	// Told under the id's session lock, and only while this connection still
+	// holds the session: a successor that took it over after the CONNACK has
+	// been established already, and an establishment told after it would
+	// store or register this connection over it.
+	unlock := s.sessions.lock(cl.ID)
+	if !cl.IsTakenOver() {
+		s.hooks.OnSessionEstablished(cl, pk)
+	}
+	unlock()
 
 	err = cl.Read(s.receivePacket)
 	if err != nil {
@@ -566,21 +574,20 @@ func (s *Server) endConnection(cl *Client, listener string, err error) error {
 	s.Log.Debug("client disconnected", "error", err, "client", cl.ID, "remote", cl.Net.Remote, "listener", listener)
 
 	expire := (cl.Properties.ProtocolVersion == 5 && cl.Properties.Props.SessionExpiryInterval == 0) || (cl.Properties.ProtocolVersion < 5 && cl.Properties.Clean)
+	// OnDisconnect and the cleanup run under the id's session lock, so a
+	// successor attaching now either takes this session over first (and this
+	// end, told so by IsTakenOver, leaves it alone) or finds it gone. Both act
+	// on the client id: run beside a takeover, the cleanup removed the
+	// successor's subscriptions and its s.Clients entry, and a storage hook
+	// deleted or overwrote the record the successor had just stored.
+	unlock := s.sessions.lock(cl.ID)
 	s.hooks.OnDisconnect(cl, err, expire)
-
-	// Under the id's session lock, so a successor attaching now either takes
-	// this session over first (and this end leaves it alone) or finds it gone:
-	// the cleanup runs on the client id, and run beside a takeover it removed
-	// the successor's subscriptions and its entry in s.Clients.
-	if expire {
-		unlock := s.sessions.lock(cl.ID)
-		if !cl.IsTakenOver() {
-			cl.ClearInflights()
-			s.UnsubscribeClient(cl)
-			s.Clients.DeleteClient(cl) // [MQTT-4.1.0-2] ![MQTT-3.1.2-23]
-		}
-		unlock()
+	if expire && !cl.IsTakenOver() {
+		cl.ClearInflights()
+		s.UnsubscribeClient(cl)
+		s.Clients.DeleteClient(cl) // [MQTT-4.1.0-2] ![MQTT-3.1.2-23]
 	}
+	unlock()
 
 	return err
 }
@@ -2058,8 +2065,12 @@ func minimum(a, b int64) (m int64) {
 
 // sessionLocks serialises, per client id, the acts that read the session a
 // client id holds and then replace or remove it: a connection taking the
-// session over (attachSession), a connection ending with its session
-// (endConnection), and the expiry sweep (clearExpiredClients). Each reads
+// session over (attachSession) and being told OnSessionEstablished, a
+// connection ending (endConnection, OnDisconnect included), the expiry sweep
+// (clearExpiredClients) and DiscardClient. The hooks those acts call
+// (OnSessionEstablished, OnDisconnect, OnUnsubscribed, OnClientExpired) run
+// under the lock, so they must not attach, end or discard a client of the
+// same id; Clients.DeleteClient is the in-hook way to drop the entry. Each reads
 // s.Clients and the topic index under the id and then writes them; run
 // concurrently, two of them each acted on what the other had already
 // replaced. A broker restarted under thousands of devices meets exactly that:
@@ -2099,4 +2110,24 @@ func (l *sessionLocks) lock(id string) (unlock func()) {
 		}
 		l.mu.Unlock()
 	}
+}
+
+// DiscardClient ends cl's session for good, as an expiry would: its inflights
+// and subscriptions go, it leaves s.Clients and OnClientExpired is told, so a
+// storage hook drops its record. It does so under the id's session lock and
+// only while s.Clients still holds cl and nothing took it over, and reports
+// whether it did: an embedder discarding a session it listed earlier never
+// removes one a reconnecting client has taken since. It must not be called
+// from a hook the session lock is held for (sessionLocks).
+func (s *Server) DiscardClient(cl *Client) bool {
+	unlock := s.sessions.lock(cl.ID)
+	defer unlock()
+	if cur, ok := s.Clients.Get(cl.ID); !ok || cur != cl || cl.IsTakenOver() {
+		return false
+	}
+	cl.ClearInflights()
+	s.UnsubscribeClient(cl)
+	s.Clients.DeleteClient(cl)
+	s.hooks.OnClientExpired(cl)
+	return true
 }

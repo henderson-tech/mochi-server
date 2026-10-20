@@ -168,3 +168,26 @@ func TestExpirySweepKeepsANewSession(t *testing.T) {
 	require.True(t, ok, "the sweep deleted the session a new connection holds")
 	require.Same(t, next, holder)
 }
+
+// DiscardClient ends the session it names and only that one: once a
+// connection has taken the id over, discarding the client an embedder listed
+// earlier leaves the new session, its entry and its subscription alone.
+func TestDiscardClientRemovesOnlyTheClientItNames(t *testing.T) {
+	s := newServer()
+	listed := sessionClient(s, false)
+	s.Clients.Add(listed)
+	next, _, _ := newTestClient()
+	next.ID = "zen"
+	s.attachSession(connectPacket(false), next)
+
+	require.False(t, s.DiscardClient(listed), "a taken-over client was discarded")
+	holder, ok := s.Clients.Get("zen")
+	require.True(t, ok)
+	require.Same(t, next, holder)
+	require.Contains(t, s.Topics.Subscribers("a/b").Subscriptions, "zen")
+
+	require.True(t, s.DiscardClient(next))
+	_, ok = s.Clients.Get("zen")
+	require.False(t, ok, "the discarded session is still listed")
+	require.NotContains(t, s.Topics.Subscribers("a/b").Subscriptions, "zen")
+}

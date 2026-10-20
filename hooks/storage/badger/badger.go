@@ -222,6 +222,12 @@ func (h *Hook) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
 		return
 	}
 
+	// A client a successor took over no longer owns the record: the server
+	// tells OnDisconnect under the session lock, so IsTakenOver is settled,
+	// and the successor's record must be neither overwritten nor deleted.
+	if cl.IsTakenOver() {
+		return
+	}
 	// A client without a connection, stopped as the server shut down, is one
 	// the server restored from this store as it booted (Server.loadClients):
 	// its record is what was just read. Rewriting it cost a write per stored
