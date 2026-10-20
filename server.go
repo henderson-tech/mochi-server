@@ -686,6 +686,7 @@ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 			return false                           // [MQTT-3.2.2-3]
 		}
 
+		existing.State.sessionResumed.Store(true) // before the takeover is visible: sendLWT reads both
 		existing.State.isTakenOver.Store(true)
 		if existing.State.Inflight.Len() > 0 {
 			cl.State.Inflight = existing.State.Inflight.Clone() // [MQTT-3.1.2-5]
@@ -1808,18 +1809,23 @@ func (s *Server) sendLWT(cl *Client) {
 	}
 
 	if cl.Properties.Will.WillDelayInterval > 0 {
-		// A connection already taken over has its delay cut short by the
-		// connection that took the id [MQTT-3.1.3-9]: queued under the shared
-		// client id, its Will would fire while the successor is connected,
-		// and clear the successor's own Will.
-		if cl.IsTakenOver() {
+		// A connection already taken over never queues its Will under the
+		// shared client id, where it would fire while the successor is
+		// connected and clear the successor's own Will. A successor that
+		// resumed the session cut the delay short, so the Will is not sent
+		// [MQTT-3.1.3-9]; one that started clean ended the session, so the
+		// Will goes now, the session's end coming before the delay's
+		// [MQTT-3.1.2-8].
+		switch {
+		case cl.State.sessionResumed.Load():
 			atomic.StoreUint32(&cl.Properties.Will.Flag, 0)
 			return
+		case !cl.IsTakenOver():
+			pk.Connect.WillProperties.WillDelayInterval = cl.Properties.Will.WillDelayInterval
+			pk.Expiry = time.Now().Unix() + int64(pk.Connect.WillProperties.WillDelayInterval)
+			s.loop.willDelayed.Add(cl.ID, pk)
+			return
 		}
-		pk.Connect.WillProperties.WillDelayInterval = cl.Properties.Will.WillDelayInterval
-		pk.Expiry = time.Now().Unix() + int64(pk.Connect.WillProperties.WillDelayInterval)
-		s.loop.willDelayed.Add(cl.ID, pk)
-		return
 	}
 
 	if pk.FixedHeader.Retain {

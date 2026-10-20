@@ -269,26 +269,42 @@ func TestSecondConnectSendsTheWillOnce(t *testing.T) {
 	_ = w.Close()
 }
 
-// A connection taken over before its end ran queues no delayed Will: the
-// connection that took the id cut its delay short [MQTT-3.1.3-9]. Queued
-// under the shared client id, it fired while the successor was connected and
-// cleared the successor's own Will.
+// A connection taken over before its end ran never queues its delayed Will
+// under the shared client id, where it fired while the successor was
+// connected and cleared the successor's own Will. A successor that resumed
+// the session cut the delay short, so the Will is not sent [MQTT-3.1.3-9];
+// one that started clean ended the session, so the Will goes at once
+// [MQTT-3.1.2-8].
 func TestTakenOverConnectionQueuesNoDelayedWill(t *testing.T) {
-	s := newServer()
-	old, _, _ := newTestClient()
-	old.ID = "zen"
-	old.Properties.ProtocolVersion = 4 // no DISCONNECT is written to a 3.1.1 client the test never reads
-	old.Properties.Will = Will{Flag: 1, TopicName: "lwt", Payload: []byte("old"), WillDelayInterval: 30}
-	s.Clients.Add(old)
+	for _, tc := range []struct {
+		name  string
+		clean bool
+		sent  int32
+	}{
+		{name: "successor resumes the session", clean: false, sent: 0},
+		{name: "successor starts clean", clean: true, sent: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newServer()
+			hook := new(willCount)
+			require.NoError(t, s.AddHook(hook, nil))
+			old, _, _ := newTestClient()
+			old.ID = "zen"
+			old.Properties.ProtocolVersion = 4 // no DISCONNECT is written to a 3.1.1 client the test never reads
+			old.Properties.Will = Will{Flag: 1, TopicName: "lwt", Payload: []byte("old"), WillDelayInterval: 30}
+			s.Clients.Add(old)
 
-	next, _, _ := newTestClient()
-	next.ID = "zen"
-	next.Properties.Will = Will{Flag: 1, TopicName: "lwt", Payload: []byte("next"), WillDelayInterval: 30}
-	s.attachSession(connectPacket(false), next)
-	_ = s.endConnection(old, "tcp", errors.New("connection reset"))
+			next, _, _ := newTestClient()
+			next.ID = "zen"
+			next.Properties.Will = Will{Flag: 1, TopicName: "lwt", Payload: []byte("next"), WillDelayInterval: 30}
+			s.attachSession(connectPacket(tc.clean), next)
+			_ = s.endConnection(old, "tcp", errors.New("connection reset"))
 
-	_, queued := s.loop.willDelayed.Get("zen")
-	require.False(t, queued, "the taken-over connection queued its delayed Will")
-	s.sendDelayedLWT(time.Now().Unix() + 60)
-	require.Equal(t, uint32(1), next.Properties.Will.Flag, "the successor's Will was cleared")
+			_, queued := s.loop.willDelayed.Get("zen")
+			require.False(t, queued, "the taken-over connection queued its delayed Will")
+			require.Equal(t, tc.sent, hook.sent.Load(), "Wills sent at the predecessor's end")
+			s.sendDelayedLWT(time.Now().Unix() + 60)
+			require.Equal(t, uint32(1), next.Properties.Will.Flag, "the successor's Will was cleared")
+		})
+	}
 }
