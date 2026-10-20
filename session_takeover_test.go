@@ -169,25 +169,45 @@ func TestExpirySweepKeepsANewSession(t *testing.T) {
 	require.Same(t, next, holder)
 }
 
-// DiscardClient ends the session it names and only that one: once a
-// connection has taken the id over, discarding the client an embedder listed
-// earlier leaves the new session, its entry and its subscription alone.
-func TestDiscardClientRemovesOnlyTheClientItNames(t *testing.T) {
+// DiscardClient ends the session of an offline client it names, and only
+// that one. A connected client is refused: its socket would go on with no
+// session. A taken-over client is refused: the id's new session stays. And a
+// client stopped but not yet ended is fenced, so its end, running after a
+// reconnect, leaves the new session's entry and subscription alone.
+func TestDiscardClientEndsOnlyTheOfflineSessionItNames(t *testing.T) {
 	s := newServer()
-	listed := sessionClient(s, false)
-	s.Clients.Add(listed)
-	next, _, _ := newTestClient()
-	next.ID = "zen"
-	s.attachSession(connectPacket(false), next)
-
-	require.False(t, s.DiscardClient(listed), "a taken-over client was discarded")
-	holder, ok := s.Clients.Get("zen")
+	live := sessionClient(s, false)
+	s.Clients.Add(live)
+	require.False(t, s.DiscardClient(live), "a connected client was discarded")
+	_, ok := s.Clients.Get("zen")
 	require.True(t, ok)
-	require.Same(t, next, holder)
-	require.Contains(t, s.Topics.Subscribers("a/b").Subscriptions, "zen")
 
-	require.True(t, s.DiscardClient(next))
+	taken, _, _ := newTestClient()
+	taken.ID = "zen"
+	s.attachSession(connectPacket(false), taken) // takes over live
+	require.False(t, s.DiscardClient(live), "a taken-over client was discarded")
+	holder, _ := s.Clients.Get("zen")
+	require.Same(t, taken, holder)
+
+	ending := taken
+	ending.Properties.ProtocolVersion = 4
+	ending.Properties.Clean = true
+	ending.Stop(errors.New("connection reset")) // stopped, its end not yet run
+	require.True(t, s.DiscardClient(ending))
 	_, ok = s.Clients.Get("zen")
 	require.False(t, ok, "the discarded session is still listed")
 	require.NotContains(t, s.Topics.Subscribers("a/b").Subscriptions, "zen")
+
+	next, _, _ := newTestClient()
+	next.ID = "zen"
+	s.attachSession(connectPacket(true), next)
+	sub := packets.Subscription{Filter: "a/b"}
+	next.State.Subscriptions.Add(sub.Filter, sub)
+	s.Topics.Subscribe(next.ID, sub)
+	_ = s.endConnection(ending, "tcp", errors.New("connection reset"))
+
+	holder, ok = s.Clients.Get("zen")
+	require.True(t, ok, "the discarded client's end removed the new session")
+	require.Same(t, next, holder)
+	require.Contains(t, s.Topics.Subscribers("a/b").Subscriptions, "zen", "the discarded client's end unsubscribed the new session")
 }

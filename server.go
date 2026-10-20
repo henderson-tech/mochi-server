@@ -2112,21 +2112,29 @@ func (l *sessionLocks) lock(id string) (unlock func()) {
 	}
 }
 
-// DiscardClient ends cl's session for good, as an expiry would: its inflights
-// and subscriptions go, it leaves s.Clients and OnClientExpired is told, so a
-// storage hook drops its record. It does so under the id's session lock and
-// only while s.Clients still holds cl and nothing took it over, and reports
-// whether it did: an embedder discarding a session it listed earlier never
-// removes one a reconnecting client has taken since. It must not be called
-// from a hook the session lock is held for (sessionLocks).
+// DiscardClient ends the session of an offline client for good, as an expiry
+// would: its inflights and subscriptions go, it leaves s.Clients and
+// OnClientExpired is told, so a storage hook drops its record. It does so
+// under the id's session lock and only while s.Clients still holds cl and
+// nothing took it over, and reports whether it did: an embedder discarding a
+// session it listed earlier never removes one a reconnecting client has taken
+// since. A connected client is refused: its socket would go on reading with
+// no session, so it is disconnected first (DisconnectClient). A client
+// stopped but not yet ended is fenced like a taken-over one, so its end then
+// leaves the id's next session and its stored record alone. It must not be
+// called from a hook the session lock is held for (sessionLocks).
 func (s *Server) DiscardClient(cl *Client) bool {
+	if !cl.Closed() {
+		return false
+	}
 	unlock := s.sessions.lock(cl.ID)
 	defer unlock()
 	if cur, ok := s.Clients.Get(cl.ID); !ok || cur != cl || cl.IsTakenOver() {
 		return false
 	}
 	cl.ClearInflights()
-	s.UnsubscribeClient(cl)
+	s.UnsubscribeClient(cl) // before the fence: it unsubscribes nothing for a taken-over client
+	cl.State.isTakenOver.Store(true)
 	s.Clients.DeleteClient(cl)
 	s.hooks.OnClientExpired(cl)
 	return true

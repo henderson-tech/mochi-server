@@ -52,6 +52,24 @@ func (h *disconnected) OnDisconnect(*mqtt.Client, error, bool) {
 	}
 }
 
+// established closes done once a persistent session of client id zen was
+// established. Added after the storage hook, it tells the test the store has
+// written the successor's record: the CONNACK goes out before
+// OnSessionEstablished, so the CONNACK alone does not.
+type established struct {
+	mqtt.HookBase
+	once atomic.Bool
+	done chan struct{}
+}
+
+func (h *established) ID() string           { return "established" }
+func (h *established) Provides(b byte) bool { return b == mqtt.OnSessionEstablished }
+func (h *established) OnSessionEstablished(cl *mqtt.Client, _ packets.Packet) {
+	if !cl.Properties.Clean && h.once.CompareAndSwap(false, true) {
+		close(h.done)
+	}
+}
+
 // connect opens a connection to s, sends the CONNECT fixture and returns the
 // client's end of the pipe and a channel that delivers once its CONNACK came.
 func connect(t *testing.T, s *mqtt.Server, fixture byte) (net.Conn, <-chan struct{}) {
@@ -87,6 +105,8 @@ func TestTakeoverDuringDisconnectKeepsTheSuccessorsRecord(t *testing.T) {
 	require.NoError(t, s.AddHook(store, &Options{Path: path, Mode: Sync}))
 	oldEnded := &disconnected{done: make(chan struct{})}
 	require.NoError(t, s.AddHook(oldEnded, nil))
+	nextEstablished := &established{done: make(chan struct{})}
+	require.NoError(t, s.AddHook(nextEstablished, nil))
 	require.NoError(t, s.Serve())
 
 	old, oldAcked := connect(t, s, packets.TConnectClean)
@@ -106,10 +126,13 @@ func TestTakeoverDuringDisconnectKeepsTheSuccessorsRecord(t *testing.T) {
 		t.Fatal("the successor was never acknowledged")
 	}
 	<-oldEnded.done
-	require.Eventually(t, func() bool {
-		cl, ok := s.Clients.Get("zen")
-		return ok && !cl.Closed()
-	}, 5*time.Second, 10*time.Millisecond, "the successor does not hold the session")
+	select {
+	case <-nextEstablished.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the successor's session was never established")
+	}
+	holder, ok := s.Clients.Get("zen")
+	require.True(t, ok && !holder.Closed(), "the successor does not hold the session")
 
 	// Read while the successor is still connected: its own end would write
 	// its record again and hide the loss.
