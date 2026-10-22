@@ -83,15 +83,15 @@ docker run -v $(pwd)/config.yaml:/config.yaml mochimqtt/server
 
 For most use cases, you can use File Based Configuration to configure the server, by specifying a valid `yaml` or `json` config file.
 
-A simple Dockerfile is provided for running the [cmd/main.go](cmd/main.go) Websocket, TCP, and Stats server, using the `allow-all` auth hook. 
+A simple Dockerfile is provided for running the [cmd/docker](cmd/docker/main.go) entrypoint, which loads its listeners and hooks from the mounted config file. The supplied [config.yaml](config.yaml) starts the TCP (:1883), Websocket (:1882), and Stats (:1880) servers, using the `allow-all` auth hook.
 
 ```sh
 docker build -t mochi:latest .
-docker run -p 1883:1883 -p 1882:1882 -p 8080:8080 -v $(pwd)/config.yaml:/config.yaml mochi:latest
+docker run -p 1883:1883 -p 1882:1882 -p 8080:1880 -v $(pwd)/config.yaml:/config.yaml mochi:latest
 ```
 
 ### File Based Configuration
-You can use File Based Configuration with either the Docker image (described above), or by running the build binary with the `--config=config.yaml` or `--config=config.json` parameter.
+You can use File Based Configuration with either the Docker image (described above), or by running the [cmd/docker](cmd/docker/main.go) entrypoint with the `--config=config.yaml` or `--config=config.json` parameter (for example `go run ./cmd/docker --config=config.yaml` from the repository root).
 
 Configuration files provide a convenient mechanism for easily preparing a server with the most common configurations. You can enable and configure built-in hooks and listeners, and specify server options and compatibilities:
 
@@ -128,6 +128,9 @@ Importing Mochi MQTT as a package requires just a few lines of code to get start
 ``` go
 import (
   "log"
+  "os"
+  "os/signal"
+  "syscall"
 
   mqtt "github.com/mochi-mqtt/server/v2"
   "github.com/mochi-mqtt/server/v2/hooks/auth"
@@ -198,7 +201,7 @@ A number of configurable options are available which can be used to alter the be
 
 ```go
 server := mqtt.New(&mqtt.Options{
-  Capabilities: mqtt.Capabilities{
+  Capabilities: &mqtt.Capabilities{
     MaximumSessionExpiryInterval: 3600,
     MaximumClientWritesPending: 3,
     Compatibilities: mqtt.Compatibilities{
@@ -472,13 +475,13 @@ See the [hooks example](examples/hooks/main.go) to see this feature in action.
 #### Unit Tests
 Mochi MQTT tests over a thousand scenarios with thoughtfully hand written unit tests to ensure each function does exactly what we expect. You can run the tests using go:
 ```
-go run --cover ./...
+go test -race -cover ./...
 ```
 
 #### Paho Interoperability Test
-You can check the broker against the [Paho Interoperability Test](https://github.com/eclipse/paho.mqtt.testing/tree/master/interoperability) by starting the broker using `examples/paho/main.go`, and then running the mqtt v5 and v3 tests with `python3 client_test5.py` from the _interoperability_ folder. 
+You can check the broker against the [Paho Interoperability Test](https://github.com/eclipse/paho.mqtt.testing/tree/master/interoperability) by starting the broker using `examples/paho.testing/main.go`, and then running the mqtt v5 and v3 tests with `python3 client_test5.py` from the _interoperability_ folder. 
 
-> Note that there are currently a number of outstanding issues regarding false negatives in the paho suite, and as such, certain compatibility modes are enabled in the `paho/main.go` example.
+> Note that there are currently a number of outstanding issues regarding false negatives in the paho suite, and as such, certain compatibility modes are enabled in the `examples/paho.testing/main.go` example.
 
 
 ## Performance Benchmarks

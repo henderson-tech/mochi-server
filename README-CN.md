@@ -80,15 +80,15 @@ docker run -v $(pwd)/config.yaml:/config.yaml mochimqtt/server
 ```
 
 一般情况下，您可以使用基于文件的方式来配置服务端，只需指定一个有效的 yaml 或 json 配置文件。
-我们提供了一个简单的 Dockerfile，用于运行 [cmd/main.go](cmd/main.go)  中的 Websocket(:1882)、TCP(:1883) 和服务端状态信息(:8080)这三个网络服务，它使用了一个 allow-all 的鉴权策略(Hook)。
+我们提供了一个简单的 Dockerfile，用于运行 [cmd/docker](cmd/docker/main.go) 入口程序，它从挂载的配置文件中加载监听器和钩子。仓库自带的 [config.yaml](config.yaml) 会启动 Websocket(:1882)、TCP(:1883) 和服务端状态信息(:1880)这三个网络服务，它使用了一个 allow-all 的鉴权策略(Hook)。
 
 ```sh
 docker build -t mochi:latest .
-docker run -p 1883:1883 -p 1882:1882 -p 8080:8080 -v $(pwd)/config.yaml:/config.yaml mochi:latest
+docker run -p 1883:1883 -p 1882:1882 -p 8080:1880 -v $(pwd)/config.yaml:/config.yaml mochi:latest
 ```
 
 ### 基于文件的配置
-你可以使用基于文件的配置与 Docker 镜像（上节所述）一起使用，或者通过运行编译好的可执行文件并使用 `--config=config.yaml` 或 `--config=config.json` 指定配置文件。
+你可以使用基于文件的配置与 Docker 镜像（上节所述）一起使用，或者运行 [cmd/docker](cmd/docker/main.go) 入口程序并使用 `--config=config.yaml` 或 `--config=config.json` 指定配置文件（例如在仓库根目录执行 `go run ./cmd/docker --config=config.yaml`）。
 
 配置文件使得服务端更易于管理和维护。你可以启用和配置内置的钩子(hooks)和监听器(listeners)，并指定服务器的一些选项(options)和能力(compatibilities)：
 
@@ -114,7 +114,7 @@ options:
 有一些需要注意的地方：
 
 1. 如果你使用基于文件的配置，现在支持配置的hook类型只有auth、storage、debug这三种，每种类型的钩子只能有一个。
-2. 你只能在基于文件的配置中使用内置钩子(mochi-mqtt里面默认已经存在的hook，你自己创建的不算)，因为钩子的配置需要先跟conf.toml的结构匹配。
+2. 你只能在基于文件的配置中使用内置钩子(mochi-mqtt里面默认已经存在的hook，你自己创建的不算)，因为服务端需要事先知道钩子的类型和配置结构才能加载它。
 3. 你只能使用内置监听器(listeners)，原因同上。
 
 如果你需要实现自定义的钩子(Hooks)或监听器(listeners)，请使用 [cmd/main.go](cmd/main.go) 中那样的传统方式来实现。
@@ -126,6 +126,9 @@ options:
 ``` go
 import (
   "log"
+  "os"
+  "os/signal"
+  "syscall"
 
   mqtt "github.com/mochi-mqtt/server/v2"
   "github.com/mochi-mqtt/server/v2/hooks/auth"
@@ -195,7 +198,7 @@ func main() {
 有许多可配置的选项(Options)可用于更改服务器的行为或限制对某些功能的访问。
 ```go
 server := mqtt.New(&mqtt.Options{
-  Capabilities: mqtt.Capabilities{
+  Capabilities: &mqtt.Capabilities{
     MaximumSessionExpiryInterval: 3600,
     MaximumClientWritesPending: 3,
     Compatibilities: mqtt.Compatibilities{
@@ -212,14 +215,14 @@ server := mqtt.New(&mqtt.Options{
 请参考 mqtt.Options、mqtt.Capabilities 和 mqtt.Compatibilities 结构体，以查看完整的所有服务端选项。 ClientNetWriteBufferSize 和 ClientNetReadBufferSize 可以根据你的需求配置调整每个客户端的内存使用状况。其中 Capabilities.MaximumClientWritesPending 的大小会影响服务器运行内存占用，如果 IoT 设备同时在线的数量比较多，设置的值很大，尽管没有收发数据，服务器运行内存占用也会增加很多，默认该数值为 1024*8 ,可以根据实际情况调整该参数。
 
 
-`ClientNetWriteTimeout` 用于限制单次向客户端连接写入的时长。尽管它默认关闭，仍然建议设置。`WritePacket` 在写入期间持有客户端的锁，因此一个已经停止读取自己套接字的客户端，只要还连着就会一直持有这把锁，所有需要它的其他协程都要等待，其中就包括为向该客户端投递 QoS 1 消息而获取报文标识符的那个。本应丢弃慢客户端的发送队列上限和 `OnPublishDropped` 也在同一把锁之后，所以在 QoS 1 下永远不会被触发。设置该超时之后，未能在规定时间内完成的写入会失败，锁被释放，该客户端会被停止，因为超时的写入已经把半个报文放到了链路上，这个流无法继续。
+`ClientNetWriteTimeout` 用于限制单次向客户端连接写入的时长。未设置时，这个上限是客户端的 keepalive 过期时间；设置后则由你指定，如果 1.5 倍 keepalive 比你愿意等待的时间更长，就值得设置。`WritePacket` 在写入期间持有客户端的锁，因此一个已经停止读取自己套接字的客户端，只要还连着就会一直持有这把锁，所有需要它的其他协程都要等待，其中就包括为向该客户端投递 QoS 1 消息而获取报文标识符的那个。本应丢弃慢客户端的发送队列上限和 `OnPublishDropped` 也在同一把锁之后，所以在 QoS 1 下永远不会被触发。设置该超时之后，未能在规定时间内完成的写入会失败，锁被释放，该客户端会被停止，因为超时的写入已经把半个报文放到了链路上，这个流无法继续。
 ### 默认配置说明(Default Configuration Notes)
 
 关于决定默认配置的值，在这里进行一些说明：
 
 - 默认情况下，server.Options.Capabilities.MaximumMessageExpiryInterval 的值被设置为 86400（24小时），以防止在使用默认配置时网络上暴露服务器而受到恶意DOS攻击（如果不配置到期时间将允许无限数量的保留retained/待发送inflight消息累积）。如果您在一个受信任的环境中运行，或者您有更大的保留期容量，您可以选择覆盖此设置（设置为0 以取消到期限制）。
 
-- 默认情况下，server.Options.ClientNetWriteTimeout 的值为 0，这会让向客户端的写入不受限制，也是该选项出现之前每个版本的行为。保持关闭是为了让升级本身不改变任何行为，但如果你的部署中可能存在停止读取的客户端，就应该设置它：它决定了这样一个客户端能持有自己写锁的时间上限，超过该时间的写入会使该客户端被停止。
+- 默认情况下，server.Options.ClientNetWriteTimeout 的值为 0，此时写入改由客户端的 keepalive 过期时间限制，这与该选项出现之前每个版本给写入的限制相同，所以升级本身不会改变任何行为。如果你需要比 1.5 倍 keepalive 更紧的上限，或者你的客户端以 keepalive 0 连接（这是无论如何都没有上限的唯一情形），就应该设置它：它决定了一个停止读取的客户端能持有自己写锁的时间上限，超过该时间的写入会使该客户端被停止。
 
 ## 事件钩子(Event Hooks)
 
@@ -486,14 +489,14 @@ server.InjectPacket(cl, packets.Packet{
 
 Mochi MQTT 使用精心编写的单元测试，测试了一千多种场景，以确保每个函数都表现出我们期望的行为。您可以使用以下命令运行测试：
 ```
-go run --cover ./...
+go test -race -cover ./...
 ```
 
 #### Paho 互操作性测试(Paho Interoperability Test)
 
-您可以使用 `examples/paho/main.go` 启动服务器，然后在 _interoperability_ 文件夹中运行 `python3 client_test5.py` 来检查代理是否符合 [Paho互操作性测试](https://github.com/eclipse/paho.mqtt.testing/tree/master/interoperability) 的要求，包括 MQTT v5 和 v3 的测试。
+您可以使用 `examples/paho.testing/main.go` 启动服务器，然后在 _interoperability_ 文件夹中运行 `python3 client_test5.py` 来检查代理是否符合 [Paho互操作性测试](https://github.com/eclipse/paho.mqtt.testing/tree/master/interoperability) 的要求，包括 MQTT v5 和 v3 的测试。
 
-> 请注意，关于 paho 测试套件存在一些尚未解决的问题，因此在 `paho/main.go` 示例中启用了某些兼容性模式。
+> 请注意，关于 paho 测试套件存在一些尚未解决的问题，因此在 `examples/paho.testing/main.go` 示例中启用了某些兼容性模式。
 
 
 ## 基准测试(Performance Benchmarks)

@@ -59,7 +59,6 @@ MQTT v3.0.0 と v3.1.1 のサポートはハイブリッド互換性があると
 - 新しい特徴やイベントフックのリクエストは [open an issue](https://github.com/mochi-mqtt/server/issues) へ！
 - クラスターのサポート
 - メトリックスサポートの強化
-- ファイルベースの設定(Dockerイメージのサポート)
 
 ## Quick Start
 ### GoでのBrokerの動かし方
@@ -79,15 +78,15 @@ or
 docker run mochimqtt/server
 ```
 
-これは実装途中です。[file-based configuration](https://github.com/orgs/mochi-mqtt/projects/2) は、この実装をよりよくサポートするために開発中です。
+ほとんどの用途では、有効な `yaml` または `json` の設定ファイルを指定するファイルベースの設定でサーバーを構成できます（設定例は [examples/config](examples/config)）。ファイルベースの設定で使えるフックのタイプは auth、storage、debug のみで、各タイプにつき1つだけです。サーバーがタイプと設定構造を事前に知っている必要があるため、使えるのは組み込みのフックと組み込みのリスナーのみです。カスタムのフックやリスナーは [cmd/main.go](cmd/main.go) のようにコードで設定してください。
 より実質的なdockerのサポートが議論されています。_Docker環境で使っている方は是非この議論に参加してください。_ [ここ](https://github.com/orgs/mochi-mqtt/discussions/281#discussion-5544545) や [ここ](https://github.com/orgs/mochi-mqtt/discussions/209)。
 
-[cmd/main.go](cmd/main.go)の Websocket, TCP, Statsサーバを実行するために、シンプルなDockerfileが提供されます。 
+[cmd/docker](cmd/docker/main.go) のエントリポイントを実行するために、シンプルなDockerfileが提供されます。リスナーとフックはマウントした設定ファイルから読み込まれ、同梱の [config.yaml](config.yaml) では `allow-all` 認証フックを使って TCP (:1883)、Websocket (:1882)、Stats (:1880) サーバを起動します。
 
 
 ```sh
 docker build -t mochi:latest .
-docker run -p 1883:1883 -p 1882:1882 -p 8080:8080 mochi:latest
+docker run -p 1883:1883 -p 1882:1882 -p 8080:1880 -v $(pwd)/config.yaml:/config.yaml mochi:latest
 ```
 
 ## Mochi MQTTを使って開発するには
@@ -96,6 +95,9 @@ Mochi MQTTをパッケージとしてインポートするにはほんの数行�
 ``` go
 import (
   "log"
+  "os"
+  "os/signal"
+  "syscall"
 
   mqtt "github.com/mochi-mqtt/server/v2"
   "github.com/mochi-mqtt/server/v2/hooks/auth"
@@ -166,7 +168,7 @@ TLSを設定するには`*listeners.Config`を渡すことができます。
 
 ```go
 server := mqtt.New(&mqtt.Options{
-  Capabilities: mqtt.Capabilities{
+  Capabilities: &mqtt.Capabilities{
     MaximumSessionExpiryInterval: 3600,
     MaximumClientWritesPending: 3,
     Compatibilities: mqtt.Compatibilities{
@@ -186,13 +188,13 @@ mqtt.Options、mqtt.Capabilities、mqtt.Compatibilitiesの構造体はオプシ�
 `Capabilities.MaximumClientWritesPending`のサイズは、サーバーのメモリ使用量に影響を与えます。IoTデバイスが同時にオンラインで多数存在する場合、また設定値が非常に大きい場合、データの送受信がなくても、サーバーのメモリ使用量は大幅に増加します。デフォルト値は1024*8で、実際の状況に応じてこのパラメータを調整することができます。
 
 
-`ClientNetWriteTimeout`はクライアントの接続への1回の書き込みを制限します。デフォルトは無効ですが、設定することをおすすめします。`WritePacket`は書き込みの間クライアントのロックを保持するため、自分のソケットを読まなくなったクライアントは接続している限りそのロックを持ち続け、それを必要とする他のすべてのゴルーチンが待たされます。そこには、そのクライアントへのQoS 1配信のためにパケット識別子を取得するものも含まれます。遅いクライアントを切り捨てるはずの送信キューの上限と`OnPublishDropped`も同じロックの後ろにあるため、QoS 1では決して到達しません。タイムアウトを設定すると、時間内に完了しなかった書き込みは失敗し、ロックは解放され、そのクライアントは停止されます。タイムアウトした書き込みはすでにパケットの一部を回線に送り出しており、そのストリームは継続できないからです。
+`ClientNetWriteTimeout`はクライアントの接続への1回の書き込みを制限します。未設定の場合、その上限はクライアントのkeepaliveの期限です。設定した場合は指定した値になり、keepaliveの1.5倍が待てる時間より長いなら設定する価値があります。`WritePacket`は書き込みの間クライアントのロックを保持するため、自分のソケットを読まなくなったクライアントは接続している限りそのロックを持ち続け、それを必要とする他のすべてのゴルーチンが待たされます。そこには、そのクライアントへのQoS 1配信のためにパケット識別子を取得するものも含まれます。遅いクライアントを切り捨てるはずの送信キューの上限と`OnPublishDropped`も同じロックの後ろにあるため、QoS 1では決して到達しません。タイムアウトを設定すると、時間内に完了しなかった書き込みは失敗し、ロックは解放され、そのクライアントは停止されます。タイムアウトした書き込みはすでにパケットの一部を回線に送り出しており、そのストリームは継続できないからです。
 ### デフォルト設定に関する注意事項
 
 いくつかのデフォルトの設定を決める際にいくつかの決定がなされましたのでここに記しておきます:
 - デフォルトとして、敵対的なネットワーク上のDoSアタックにさらされるのを防ぐために `server.Options.Capabilities.MaximumMessageExpiryInterval`は86400 (24時間)に、とセットされています。有効期限を無限にすると、保持、送信メッセージが無限に蓄積されるからです。もし信頼できる環境であったり、より大きな保存期間が可能であれば、この設定はオーバーライドできます（`0` を設定すると有効期限はなくなります。）
 
-- デフォルトとして、`server.Options.ClientNetWriteTimeout`は`0`で、クライアントへの書き込みは制限されません。これはこのオプションが存在しなかったすべてのリリースの動作です。アップグレードだけでは動作が変わらないように無効にしてありますが、読み取りを止めるクライアントが存在しうる環境では設定してください。1つのクライアントが自分の書き込みロックを保持できる時間の上限になり、それを超えた書き込みはそのクライアントを停止させます。
+- デフォルトとして、`server.Options.ClientNetWriteTimeout`は`0`で、その場合の書き込みはクライアントのkeepaliveの期限で制限されます。これはこのオプションが存在しなかったすべてのリリースが書き込みに与えていたのと同じ上限なので、アップグレードだけでは何も変わりません。keepaliveの1.5倍より厳しい上限が必要な場合や、クライアントがkeepalive `0`で接続する場合（どちらにしても上限がない唯一のケース）に設定してください。読み取りを止めたクライアントが自分の書き込みロックを保持できる時間の上限になり、それを超えた書き込みはそのクライアントを停止させます。
 
 ## Event Hooks 
 ユニバーサルイベントフックシステムは、開発者にサーバとクライアントの様々なライフサイクルをフックすることができ、ブローカーの機能を追加/変更することができます。それらのユニバーサルフックは認証、永続ストレージ、デバッグツールなど、あらゆるものに使用されています。
@@ -430,13 +432,13 @@ server.InjectPacket(cl, packets.Packet{
 #### ユニットテスト
 それぞれの関数が期待通りの動作をするように考えられてMochi MQTTテストが作成されています。テストを走らせるには:
 ```
-go run --cover ./...
+go test -race -cover ./...
 ```
 
 #### Paho相互運用性テスト
-`examples/paho/main.go`を使用してブローカーを起動し、_interoperability_フォルダの`python3 client_test5.py`のmqttv5とv3のテストを実行することで、[Paho Interoperability Test](https://github.com/eclipse/paho.mqtt.testing/tree/master/interoperability)を確認することができます。
+`examples/paho.testing/main.go`を使用してブローカーを起動し、_interoperability_フォルダの`python3 client_test5.py`のmqttv5とv3のテストを実行することで、[Paho Interoperability Test](https://github.com/eclipse/paho.mqtt.testing/tree/master/interoperability)を確認することができます。
 
-> pahoスイートには現在は何個かの偽陰性に関わるissueがあるので、`paho/main.go`の例ではいくつかの互換性モードがオンになっていることに注意してください。
+> pahoスイートには現在は何個かの偽陰性に関わるissueがあるので、`examples/paho.testing/main.go`の例ではいくつかの互換性モードがオンになっていることに注意してください。
 
 
 
