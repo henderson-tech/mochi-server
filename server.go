@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -174,6 +175,7 @@ type Server struct {
 	Log          *slog.Logger         // minimal no-alloc logger
 	hooks        *Hooks               // hooks contains hooks for extra functionality such as auth and persistent storage
 	inlineClient *Client              // inlineClient is a special client used for inline subscriptions and inline Publish
+	sessions     sessionLocks         // serialises the acts that read and replace one client id's session
 }
 
 // loop contains interval tickers for the system events loop.
@@ -495,14 +497,7 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 
 	s.hooks.OnSessionEstablish(cl, pk)
 
-	sessionPresent := s.inheritClientSession(pk, cl)
-	s.Clients.Add(cl) // [MQTT-4.1.0-1]
-
-	// The session is this connection's now, so a Will an earlier connection
-	// left delayed is void whether or not the CONNACK arrives. Deleted only
-	// after the write, a failed CONNACK left that Will to fire beside the one
-	// this connection publishes as it ends. [MQTT-3.1.3-9]
-	s.loop.willDelayed.Delete(cl.ID)
+	sessionPresent := s.attachSession(pk, cl)
 
 	err = s.SendConnack(cl, code, sessionPresent, nil) // [MQTT-3.1.4-5] [MQTT-3.2.0-1] [MQTT-3.2.0-2] &[MQTT-3.14.0-1]
 	if err != nil {
@@ -516,7 +511,15 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 		}
 	}
 
-	s.hooks.OnSessionEstablished(cl, pk)
+	// Told under the id's session lock, and only while this connection still
+	// holds the session: a successor that took it over after the CONNACK has
+	// been established already, and an establishment told after it would
+	// store or register this connection over it.
+	unlock := s.sessions.lock(cl.ID)
+	if !cl.IsTakenOver() {
+		s.hooks.OnSessionEstablished(cl, pk)
+	}
+	unlock()
 
 	err = cl.Read(s.receivePacket)
 	if err != nil {
@@ -556,6 +559,15 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 // dead entry stayed in s.Clients until MaximumSessionExpiryInterval, which
 // defaults to never.
 func (s *Server) endConnection(cl *Client, listener string, err error) error {
+	// The whole end runs under the id's session lock, so a successor
+	// attaching now either takes this session over first (and this end, told
+	// so by IsTakenOver, leaves it alone) or finds it gone. Each step acts on
+	// the client id: run beside a takeover, the cleanup removed the
+	// successor's subscriptions and its s.Clients entry, and a storage hook
+	// (OnWillSent as the Will goes, then OnDisconnect) overwrote or deleted
+	// the record the successor had just stored.
+	unlock := s.sessions.lock(cl.ID)
+	defer unlock()
 	if err != nil {
 		s.sendLWT(cl)
 		cl.Stop(err)
@@ -566,11 +578,10 @@ func (s *Server) endConnection(cl *Client, listener string, err error) error {
 
 	expire := (cl.Properties.ProtocolVersion == 5 && cl.Properties.Props.SessionExpiryInterval == 0) || (cl.Properties.ProtocolVersion < 5 && cl.Properties.Clean)
 	s.hooks.OnDisconnect(cl, err, expire)
-
 	if expire && !cl.IsTakenOver() {
 		cl.ClearInflights()
 		s.UnsubscribeClient(cl)
-		s.Clients.Delete(cl.ID) // [MQTT-4.1.0-2] ![MQTT-3.1.2-23]
+		s.Clients.DeleteClient(cl) // [MQTT-4.1.0-2] ![MQTT-3.1.2-23]
 	}
 
 	return err
@@ -675,6 +686,7 @@ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 			return false                           // [MQTT-3.2.2-3]
 		}
 
+		existing.State.sessionResumed.Store(true) // before the takeover is visible: sendLWT reads both
 		existing.State.isTakenOver.Store(true)
 		if existing.State.Inflight.Len() > 0 {
 			cl.State.Inflight = existing.State.Inflight.Clone() // [MQTT-3.1.2-5]
@@ -707,6 +719,26 @@ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 	}
 
 	return false // [MQTT-3.2.2-2]
+}
+
+// attachSession makes cl the holder of its client id's session: it takes over
+// the session an earlier connection or the store left, and registers cl. The
+// read of the session it takes over and its registration happen under the
+// id's session lock, so every earlier connection is taken over by the one
+// that follows it and the last to attach holds the session.
+func (s *Server) attachSession(pk packets.Packet, cl *Client) bool {
+	unlock := s.sessions.lock(cl.ID)
+	defer unlock()
+	sessionPresent := s.inheritClientSession(pk, cl)
+	s.Clients.Add(cl) // [MQTT-4.1.0-1]
+	// The session is this connection's now, so a Will an earlier connection
+	// left delayed is void whether or not the CONNACK arrives. Deleted only
+	// after the write, a failed CONNACK left that Will to fire beside the one
+	// this connection publishes as it ends; deleted under the lock, the
+	// delayed send (sendDelayedLWT) never fires it at this connection.
+	// [MQTT-3.1.3-9]
+	s.loop.willDelayed.Delete(cl.ID)
+	return sessionPresent
 }
 
 // SendConnack returns a Connack packet to a client.
@@ -858,8 +890,11 @@ func (s *Server) processPacket(cl *Client, pk packets.Packet) error {
 
 // processConnect processes a Connect packet. The packet cannot be used to establish
 // a new connection on an existing connection. See EstablishConnection instead.
+// processConnect refuses a second CONNECT. The error ends the connection, and
+// its end (endConnection) publishes the Will under the id's session lock; sent
+// here, outside it, the Will's OnWillSent could rewrite the record of a
+// successor taking the session over at the same moment.
 func (s *Server) processConnect(cl *Client, _ packets.Packet) error {
-	s.sendLWT(cl)
 	return packets.ErrProtocolViolationSecondConnect // [MQTT-3.1.0-2]
 }
 
@@ -1774,10 +1809,23 @@ func (s *Server) sendLWT(cl *Client) {
 	}
 
 	if cl.Properties.Will.WillDelayInterval > 0 {
-		pk.Connect.WillProperties.WillDelayInterval = cl.Properties.Will.WillDelayInterval
-		pk.Expiry = time.Now().Unix() + int64(pk.Connect.WillProperties.WillDelayInterval)
-		s.loop.willDelayed.Add(cl.ID, pk)
-		return
+		// A connection already taken over never queues its Will under the
+		// shared client id, where it would fire while the successor is
+		// connected and clear the successor's own Will. A successor that
+		// resumed the session cut the delay short, so the Will is not sent
+		// [MQTT-3.1.3-9]; one that started clean ended the session, so the
+		// Will goes now, the session's end coming before the delay's
+		// [MQTT-3.1.2-8].
+		switch {
+		case cl.State.sessionResumed.Load():
+			atomic.StoreUint32(&cl.Properties.Will.Flag, 0)
+			return
+		case !cl.IsTakenOver():
+			pk.Connect.WillProperties.WillDelayInterval = cl.Properties.Will.WillDelayInterval
+			pk.Expiry = time.Now().Unix() + int64(pk.Connect.WillProperties.WillDelayInterval)
+			s.loop.willDelayed.Add(cl.ID, pk)
+			return
+		}
 	}
 
 	if pk.FixedHeader.Retain {
@@ -1945,10 +1993,22 @@ func (s *Server) clearExpiredClients(dt int64) {
 		}
 
 		if disconnected+int64(expire) < dt {
-			s.hooks.OnClientExpired(client)
-			s.Clients.Delete(id) // [MQTT-4.1.0-2]
+			s.expireClient(id, client)
 		}
 	}
+}
+
+// expireClient removes the expired session client listed under id, unless a
+// connection has taken the id since the sweep listed it: the sweep works on a
+// copy of s.Clients, and deleting by id removed the new connection's session.
+func (s *Server) expireClient(id string, client *Client) {
+	unlock := s.sessions.lock(id)
+	defer unlock()
+	if cur, ok := s.Clients.Get(id); !ok || cur != client {
+		return
+	}
+	s.hooks.OnClientExpired(client)
+	s.Clients.Delete(id) // [MQTT-4.1.0-2]
 }
 
 // clearExpiredRetainedMessage deletes retained messages from topics if they have expired.
@@ -1982,22 +2042,40 @@ func (s *Server) clearExpiredInflights(now int64) {
 func (s *Server) sendDelayedLWT(dt int64) {
 	for id, pk := range s.loop.willDelayed.GetAll() {
 		if dt > pk.Expiry {
-			// Expiry held the end of the Will Delay Interval, which has now
-			// passed. It is not the message's expiry: left in place, every
-			// delivery of the Will would be refused as expired.
-			// publishToSubscribers gives the message its own.
-			pk.Expiry = 0
-			s.publishToSubscribers(pk) // [MQTT-3.1.2-8]
-			if cl, ok := s.Clients.Get(id); ok {
-				if pk.FixedHeader.Retain {
-					s.retainMessage(cl, pk)
-				}
-				cl.Properties.Will = Will{} // [MQTT-3.1.2-10]
-				s.hooks.OnWillSent(cl, pk)
-			}
-			s.loop.willDelayed.Delete(id)
+			s.sendDelayedWill(id, dt)
 		}
 	}
+}
+
+// sendDelayedWill publishes the delayed Will listed under id, under the id's
+// session lock and only while it is still listed and due at dt: the list is read from a
+// copy, and a connection that took the id since has deleted it
+// (attachSession). Sent from the copy, the earlier connection's Will fired
+// after the session was taken, and the new connection's own Will was
+// cleared in its place.
+func (s *Server) sendDelayedWill(id string, dt int64) {
+	unlock := s.sessions.lock(id)
+	defer unlock()
+	// Rechecked under the lock: the Will listed now may be a newer one, left
+	// by a connection that took the id and ended since, still in its delay.
+	pk, ok := s.loop.willDelayed.Get(id)
+	if !ok || dt <= pk.Expiry {
+		return
+	}
+	// Expiry held the end of the Will Delay Interval, which has now passed.
+	// It is not the message's expiry: left in place, every delivery of the
+	// Will would be refused as expired. publishToSubscribers gives the
+	// message its own.
+	pk.Expiry = 0
+	s.publishToSubscribers(pk) // [MQTT-3.1.2-8]
+	if cl, ok := s.Clients.Get(id); ok {
+		if pk.FixedHeader.Retain {
+			s.retainMessage(cl, pk)
+		}
+		cl.Properties.Will = Will{} // [MQTT-3.1.2-10]
+		s.hooks.OnWillSent(cl, pk)
+	}
+	s.loop.willDelayed.Delete(id)
 }
 
 // Int64toa converts an int64 to a string.
@@ -2020,4 +2098,81 @@ func minimum(a, b int64) (m int64) {
 		m = b
 	}
 	return
+}
+
+// sessionLocks serialises, per client id, the acts that read the session a
+// client id holds and then replace or remove it: a connection taking the
+// session over (attachSession) and being told OnSessionEstablished, a
+// connection ending (endConnection, OnDisconnect included), the expiry sweep
+// (clearExpiredClients) and DiscardClient. The hooks those acts call
+// (OnSessionEstablished, OnDisconnect, OnUnsubscribed, OnClientExpired) run
+// under the lock, so they must not attach, end or discard a client of the
+// same id; Clients.DeleteClient is the in-hook way to drop the entry. Each reads
+// s.Clients and the topic index under the id and then writes them; run
+// concurrently, two of them each acted on what the other had already
+// replaced. A broker restarted under thousands of devices meets exactly that:
+// a device's abandoned socket and its retry attach at once. Locks are per id,
+// so unrelated clients never wait on each other, and an entry lives only
+// while someone holds or waits for it.
+type sessionLocks struct {
+	mu sync.Mutex
+	m  map[string]*sessionLock
+}
+
+type sessionLock struct {
+	sync.Mutex
+	refs int
+}
+
+// lock takes id's session lock and returns its release.
+func (l *sessionLocks) lock(id string) (unlock func()) {
+	l.mu.Lock()
+	if l.m == nil {
+		l.m = map[string]*sessionLock{}
+	}
+	e := l.m[id]
+	if e == nil {
+		e = new(sessionLock)
+		l.m[id] = e
+	}
+	e.refs++
+	l.mu.Unlock()
+
+	e.Lock()
+	return func() {
+		e.Unlock()
+		l.mu.Lock()
+		if e.refs--; e.refs == 0 {
+			delete(l.m, id)
+		}
+		l.mu.Unlock()
+	}
+}
+
+// DiscardClient ends the session of an offline client for good, as an expiry
+// would: its inflights and subscriptions go, it leaves s.Clients and
+// OnClientExpired is told, so a storage hook drops its record. It does so
+// under the id's session lock and only while s.Clients still holds cl and
+// nothing took it over, and reports whether it did: an embedder discarding a
+// session it listed earlier never removes one a reconnecting client has taken
+// since. A connected client is refused: its socket would go on reading with
+// no session, so it is disconnected first (DisconnectClient). A client
+// stopped but not yet ended is fenced like a taken-over one, so its end then
+// leaves the id's next session and its stored record alone. It must not be
+// called from a hook the session lock is held for (sessionLocks).
+func (s *Server) DiscardClient(cl *Client) bool {
+	if !cl.Closed() {
+		return false
+	}
+	unlock := s.sessions.lock(cl.ID)
+	defer unlock()
+	if cur, ok := s.Clients.Get(cl.ID); !ok || cur != cl || cl.IsTakenOver() {
+		return false
+	}
+	cl.ClearInflights()
+	s.UnsubscribeClient(cl) // before the fence: it unsubscribes nothing for a taken-over client
+	cl.State.isTakenOver.Store(true)
+	s.Clients.DeleteClient(cl)
+	s.hooks.OnClientExpired(cl)
+	return true
 }

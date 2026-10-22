@@ -89,6 +89,19 @@ func (cl *Clients) Delete(id string) {
 	delete(cl.internal, id)
 }
 
+// DeleteClient removes val from the internal map only while the map still holds
+// val under its id, and reports whether it did. A connection or a sweep that
+// means to remove one client must not remove a later client of the same id.
+func (cl *Clients) DeleteClient(val *Client) bool {
+	cl.Lock()
+	defer cl.Unlock()
+	if cur, ok := cl.internal[val.ID]; !ok || cur != val {
+		return false
+	}
+	delete(cl.internal, val.ID)
+	return true
+}
+
 // GetByListener returns clients matching a listener id.
 //
 // The capacity hint used to read cl.Len(), which takes
@@ -166,6 +179,7 @@ type ClientState struct {
 	outbound        chan *packets.Packet // queue for pending outbound packets
 	endOnce         sync.Once            // only end once
 	isTakenOver     atomic.Bool          // used to identify orphaned clients
+	sessionResumed  atomic.Bool          // the client that took this one over resumed its session
 	packetID        uint32               // the current highest packetID
 	open            context.Context      // indicate that the client is open for packet exchange
 	cancelOpen      context.CancelFunc   // cancel function for open context
