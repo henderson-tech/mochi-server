@@ -1,5 +1,7 @@
 # Mochi-MQTT Server
 
+> **This is henderson-tech's fork for Voke.** The `voke` branch carries a few generic fixes on top of upstream's `release/2.8.0`; what they are, the `v2.8.0-voke.N` tags and how to rebase are in [VOKE.md](VOKE.md).
+
 <p align="center">
     
 ![build status](https://github.com/mochi-mqtt/server/actions/workflows/build.yml/badge.svg) 
@@ -81,15 +83,15 @@ docker run -v $(pwd)/config.yaml:/config.yaml mochimqtt/server
 
 For most use cases, you can use File Based Configuration to configure the server, by specifying a valid `yaml` or `json` config file.
 
-A simple Dockerfile is provided for running the [cmd/main.go](cmd/main.go) Websocket, TCP, and Stats server, using the `allow-all` auth hook. 
+A simple Dockerfile is provided for running the [cmd/docker](cmd/docker/main.go) entrypoint, which loads its listeners and hooks from the mounted config file. The supplied [config.yaml](config.yaml) starts the TCP (:1883), Websocket (:1882), and Stats (:1880) servers, using the `allow-all` auth hook.
 
 ```sh
 docker build -t mochi:latest .
-docker run -p 1883:1883 -p 1882:1882 -p 8080:8080 -v $(pwd)/config.yaml:/config.yaml mochi:latest
+docker run -p 1883:1883 -p 1882:1882 -p 8080:1880 -v $(pwd)/config.yaml:/config.yaml mochi:latest
 ```
 
 ### File Based Configuration
-You can use File Based Configuration with either the Docker image (described above), or by running the build binary with the `--config=config.yaml` or `--config=config.json` parameter.
+You can use File Based Configuration with either the Docker image (described above), or by running the [cmd/docker](cmd/docker/main.go) entrypoint with the `--config=config.yaml` or `--config=config.json` parameter (for example `go run ./cmd/docker --config=config.yaml` from the repository root).
 
 Configuration files provide a convenient mechanism for easily preparing a server with the most common configurations. You can enable and configure built-in hooks and listeners, and specify server options and compatibilities:
 
@@ -126,6 +128,9 @@ Importing Mochi MQTT as a package requires just a few lines of code to get start
 ``` go
 import (
   "log"
+  "os"
+  "os/signal"
+  "syscall"
 
   mqtt "github.com/mochi-mqtt/server/v2"
   "github.com/mochi-mqtt/server/v2/hooks/auth"
@@ -196,7 +201,7 @@ A number of configurable options are available which can be used to alter the be
 
 ```go
 server := mqtt.New(&mqtt.Options{
-  Capabilities: mqtt.Capabilities{
+  Capabilities: &mqtt.Capabilities{
     MaximumSessionExpiryInterval: 3600,
     MaximumClientWritesPending: 3,
     Compatibilities: mqtt.Compatibilities{
@@ -205,6 +210,7 @@ server := mqtt.New(&mqtt.Options{
   },
   ClientNetWriteBufferSize: 4096,
   ClientNetReadBufferSize: 4096,
+  ClientNetWriteTimeout: 5 * time.Second,
   SysTopicResendInterval: 10,
   InlineClient: false,
 })
@@ -212,11 +218,17 @@ server := mqtt.New(&mqtt.Options{
 
 Review the mqtt.Options, mqtt.Capabilities, and mqtt.Compatibilities structs for a comprehensive list of options. `ClientNetWriteBufferSize` and `ClientNetReadBufferSize` can be configured to adjust memory usage per client, based on your needs. The size of `Capabilities.MaximumClientWritesPending` will affect the memory usage of the server. If the number of IoT devices online at the same time is large, and the set value is very large, even if there is no data transmission, the memory usage of the server will increase a lot. The default value is 1024*8, and this parameter can be adjusted according to the actual situation.
 
+`ClientNetWriteTimeout` bounds a single write to a client's connection. Unset, that bound is the client's keepalive expiry; set, it is whatever you choose, which is worth doing if 1.5x keepalive is longer than you want to wait. `WritePacket` holds the client's lock across the write, so a client that has stopped reading its socket holds that lock for as long as it stays connected, and every other goroutine needing it waits, including the one taking a packet identifier for a QoS 1 delivery to that client. The outbound queue bound and `OnPublishDropped` that would otherwise shed a slow client sit behind the same lock, so at QoS 1 they are never reached. With the timeout set, a write that does not complete in time fails, the lock is released, and the client is stopped, because a timed-out write has already put part of a packet on the wire and that stream cannot be continued.
+
 ### Default Configuration Notes
 
 Some choices were made when deciding the default configuration that need to be mentioned here:
 
 - By default, the value of `server.Options.Capabilities.MaximumMessageExpiryInterval` is set to 86400 (24 hours), in order to prevent exposing the broker to DOS attacks on hostile networks when using the out-of-the-box configuration (as an infinite expiry would allow an infinite number of retained/inflight messages to accumulate). If you are operating in a trusted environment, or you have capacity for a larger retention period, you may wish to override this (set to `0` for no expiry).
+
+- By default, the value of `server.Options.ClientNetWriteTimeout` is `0`, and a write is then bounded by the client's keepalive expiry instead - the same bound every release before the option existed gave a write. So upgrading changes nothing on its own. Set the option when you want a tighter bound than 1.5x keepalive, or when your clients connect with keepalive `0`, which is the one case with no bound either way. It is what limits how long a client that has stopped reading can hold its own write lock, and a write that exceeds it stops that client.
+
+- `ClientNetWriteTimeout` is a `time.Duration`, and YAML and JSON do not spell one the same way. YAML takes `client_net_write_timeout: 5s`. JSON has no duration type, so `{"client_net_write_timeout":"5s"}` is refused and the value has to be raw nanoseconds: `{"client_net_write_timeout":5000000000}`.
 
 ## Event Hooks 
 A universal event hooks system allows developers to hook into various parts of the server and client life cycle to add and modify functionality of the broker. These universal hooks are used to provide everything from authentication, persistent storage, to debugging tools.
@@ -365,6 +377,7 @@ The function signatures for all the hooks and `mqtt.Hook` interface can be found
 | OnACLCheck             | Called when a user attempts to publish or subscribe to a topic filter. As above.                                                                                                                                                                                                                           |
 | OnSysInfoTick          | Called when the $SYS topic values are published out.                                                                                                                                                                                                                                                       |
 | OnConnect              | Called when a new client connects, may return an error or packet code to halt the client connection process.                                                                                                                                                                                               | 
+| OnConnectRefused       | Called when the server refuses a CONNECT before any other hook has run, such as an unacceptable protocol version, a bad Will, or the maximum client limit. It reports which client was refused and with which code; it cannot change the outcome.                                                          |
 | OnSessionEstablish     | Called immediately after a new client connects and authenticates and immediately before the session is established and CONNACK is sent.                                                                                                                                                                    |
 | OnSessionEstablished   | Called when a new client successfully establishes a session (after OnConnect)                                                                                                                                                                                                                              | 
 | OnDisconnect           | Called when a client is disconnected for any reason.                                                                                                                                                                                                                                                       | 
@@ -375,7 +388,7 @@ The function signatures for all the hooks and `mqtt.Hook` interface can be found
 | OnPacketProcessed      | Called when a packet has been received and successfully handled by the broker.                                                                                                                                                                                                                             | 
 | OnSubscribe            | Called when a client subscribes to one or more filters. Allows packet modification.                                                                                                                                                                                                                        | 
 | OnSubscribed           | Called when a client successfully subscribes to one or more filters.                                                                                                                                                                                                                                       | 
-| OnSelectSubscribers    | Called when subscribers have been collected for a topic, but before shared subscription subscribers have been selected. Allows receipient modification.                                                                                                                                                    | 
+| OnSelectSubscribers    | Called for every publish once subscribers have been collected for a topic, and before shared subscription subscribers have been selected. Allows recipient modification.                                                                                                                                  |
 | OnUnsubscribe          | Called when a client unsubscribes from one or more filters. Allows packet modification.                                                                                                                                                                                                                    | 
 | OnUnsubscribed         | Called when a client successfully unsubscribes from one or more filters.                                                                                                                                                                                                                                   | 
 | OnPublish              | Called when a client publishes a message. Allows packet modification.                                                                                                                                                                                                                                      | 
@@ -462,13 +475,13 @@ See the [hooks example](examples/hooks/main.go) to see this feature in action.
 #### Unit Tests
 Mochi MQTT tests over a thousand scenarios with thoughtfully hand written unit tests to ensure each function does exactly what we expect. You can run the tests using go:
 ```
-go run --cover ./...
+go test -race -cover ./...
 ```
 
 #### Paho Interoperability Test
-You can check the broker against the [Paho Interoperability Test](https://github.com/eclipse/paho.mqtt.testing/tree/master/interoperability) by starting the broker using `examples/paho/main.go`, and then running the mqtt v5 and v3 tests with `python3 client_test5.py` from the _interoperability_ folder. 
+You can check the broker against the [Paho Interoperability Test](https://github.com/eclipse/paho.mqtt.testing/tree/master/interoperability) by starting the broker using `examples/paho.testing/main.go`, and then running the mqtt v5 and v3 tests with `python3 client_test5.py` from the _interoperability_ folder. 
 
-> Note that there are currently a number of outstanding issues regarding false negatives in the paho suite, and as such, certain compatibility modes are enabled in the `paho/main.go` example.
+> Note that there are currently a number of outstanding issues regarding false negatives in the paho suite, and as such, certain compatibility modes are enabled in the `examples/paho.testing/main.go` example.
 
 
 ## Performance Benchmarks

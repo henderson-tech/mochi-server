@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 
 	pebbledb "github.com/cockroachdb/pebble"
 	mqtt "github.com/mochi-mqtt/server/v2"
@@ -79,6 +80,17 @@ type Hook struct {
 	config *Options               // options for configuring the pebble DB instance.
 	db     *pebbledb.DB           // the pebble DB instance
 	mode   *pebbledb.WriteOptions // mode holds the optional per-query parameters for Set and Delete operations
+	failed atomic.Uint64          // writes the store failed; see Errors
+}
+
+// Errors returns how many writes to the store have failed since the hook was
+// created: a value that would not encode, or a Set or Delete the database
+// refused. Each is logged and the broker carries on - a hook cannot refuse
+// the packet whose state it was saving - so this count is how an embedder
+// learns that the store no longer matches the broker's state (a metric, an
+// alarm, a readiness check).
+func (h *Hook) Errors() uint64 {
+	return h.failed.Load()
 }
 
 // ID returns the id of the hook.
@@ -268,6 +280,7 @@ func (h *Hook) OnRetainMessage(cl *mqtt.Client, pk packets.Packet, r int64) {
 		TopicName:   pk.TopicName,
 		Payload:     pk.Payload,
 		Created:     pk.Created,
+		Expiry:      pk.Expiry,
 		Client:      cl.ID,
 		Origin:      pk.Origin,
 		Properties: storage.MessageProperties{
@@ -304,6 +317,7 @@ func (h *Hook) OnQosPublish(cl *mqtt.Client, pk packets.Packet, sent int64, rese
 		Payload:     pk.Payload,
 		Sent:        sent,
 		Created:     pk.Created,
+		Expiry:      pk.Expiry,
 		Properties: storage.MessageProperties{
 			PayloadFormat:          props.PayloadFormat,
 			MessageExpiryInterval:  props.MessageExpiryInterval,
@@ -493,6 +507,7 @@ func (h *Hook) Debugf(m string, v ...any) {
 func (h *Hook) delKv(k string) error {
 	err := h.db.Delete([]byte(k), h.mode)
 	if err != nil {
+		h.failed.Add(1)
 		h.Log.Error("failed to delete data", "error", err, "key", k)
 		return err
 	}
@@ -501,9 +516,15 @@ func (h *Hook) delKv(k string) error {
 
 // setKv stores a key-value pair in the database.
 func (h *Hook) setKv(k string, v storage.Serializable) error {
-	bs, _ := v.MarshalBinary()
-	err := h.db.Set([]byte(k), bs, h.mode)
+	bs, err := v.MarshalBinary()
 	if err != nil {
+		h.failed.Add(1)
+		h.Log.Error("failed to encode data", "error", err, "key", k)
+		return err
+	}
+	err = h.db.Set([]byte(k), bs, h.mode)
+	if err != nil {
+		h.failed.Add(1)
 		h.Log.Error("failed to update data", "error", err, "key", k)
 		return err
 	}
